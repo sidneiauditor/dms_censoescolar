@@ -69,3 +69,4 @@ Menu **⋮** (canto superior direito) → **Clear cache**, se trocar o ficheiro 
 ## Próximo passo
 
 Quando a Etapa 2 estiver validada, pedir **“implementar a Etapa 3”** (merge por CNPJ normalizado e `consolidado.xlsx`).
+Etapa 2 concluída.
