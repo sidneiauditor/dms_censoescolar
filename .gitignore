@@ -1,0 +1,15 @@
+# Ambiente
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Dados carregados e gerados localmente (não versionar dados reais)
+uploads/*
+!uploads/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# Streamlit
+.streamlit/secrets.toml
