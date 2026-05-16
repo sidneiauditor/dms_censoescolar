@@ -13,6 +13,7 @@ Arquitetura (UX atual):
   a aplicar ``add_normalized_cnpj_column`` usando o consolidado + resoluções automáticas (ex.: ``CNPJ_base_escola``).
 - **Etapa 3** — merge determinístico por CNPJ; RapidFuzz opcional só sem CNPJ DMS válido.
 - **Etapa 6.1** — indicadores fiscais básicos (ISS, mensalidade, base de cálculo por matrícula) no consolidado — ver :mod:`services.indicators`.
+- **Etapa 6.2** — painel operacional: KPIs, divergências, rankings, filtros e gráficos — ver :mod:`services.dashboard_metrics`.
 """
 
 from __future__ import annotations
@@ -37,6 +38,18 @@ from services.census_consolidator import (
     CensusMergeError,
     consolidate_census_escolar,
     normalize_co_entidade,
+)
+from services.dashboard_metrics import (
+    MatriculaFaixa,
+    build_operational_table,
+    compute_divergence_counts,
+    compute_kpis,
+    compute_rankings,
+    figure_bar_iss_by_status,
+    figure_donut_match_status,
+    figure_scatter_matriculas_iss,
+    filter_operational_dataframe,
+    resolved_paths_for_dashboard,
 )
 from services.cnpj_merge import (
     MATCH_CNPJ_EXATO,
@@ -711,6 +724,151 @@ def render_etapa3_premerge_diagnostics(
             )
 
 
+def render_etapa6_2_fiscal_dashboard(df: pd.DataFrame, cm: dict[str, Any]) -> None:
+    """Painel 6.2: filtros, KPIs, divergências, rankings, gráficos e tabela operacional (delega agregações ao módulo)."""
+
+    FAIXA_LABELS: dict[str, MatriculaFaixa] = {
+        "Todas": "todas",
+        "0 matrículas": "zero",
+        "1–50 matrículas": "1_50",
+        "51–200 matrículas": "51_200",
+        "≥201 matrículas": "201_mais",
+    }
+
+    st.divider()
+    st.header("Etapa 6.2 — Painel de divergências e ranking fiscal")
+    st.caption(
+        "Base: **consolidado atual** (Etapa 3 + 6.1). Filtros e agregações são recalculados a cada rerun "
+        "via `services.dashboard_metrics` — sem misturar UI com regras de negócio dos indicadores linha a linha."
+    )
+
+    cms = dict(cm or {})
+    paths = resolved_paths_for_dashboard(df, cms)
+
+    with st.expander("Arquitetura do painel 6.2 (equipa técnica)", expanded=False):
+        st.markdown(
+            "- **dashboard_metrics** resolve colunas `dms__` / `censo__` por aliases (ISS, matrículas, dependência, razão, "
+            "CNPJ) e aplica **filtros declarativos** (`filter_operational_dataframe`).\n"
+            "- **KPIs** (`compute_kpis`): somatórios sobre o subconjunto filtrado — nota: `total_matriculas` soma o "
+            "denominador linha a linha.\n"
+            "- **Divergências** (`compute_divergence_counts`): cruzamento de `match_status_principal` com análise "
+            "de linhas **sem matrícula** não vazia/positiva.\n"
+            "- **Rankings** (`compute_rankings`): tops por linha sobre ISS bruto, `iss_por_matricula` e "
+            "`mensalidade_por_aluno` quando existirem.\n"
+            "- **Gráficos Plotly** — donut por status, barras ISS × status, dispersão matrículas × ISS.\n"
+            "- **Tabela operacional** (`build_operational_table`) — visão compacta para uso fiscal imediato.\n"
+            "- **indicators.py** continua apenas a materializar ratios no `DataFrame` (Etapa 6.1)."
+        )
+
+    status_col = "match_status_principal"
+    status_vals: list[str] = []
+    if status_col in df.columns:
+        status_vals = sorted(df[status_col].dropna().astype(str).unique().tolist())
+
+    c_f1, c_f2, c_f3 = st.columns(3)
+    with c_f1:
+        sel_stat = st.multiselect(
+            "Filtro: `match_status_principal`",
+            options=status_vals,
+            default=status_vals if status_vals else [],
+            disabled=not bool(status_vals),
+            key="dash_filter_match_status",
+            help="Remova valores para cortar categorias — lista vazio = não restringir por status.",
+        )
+    dep_col = paths.get("dependencia")
+    dep_vals: list[str] = []
+    if dep_col and dep_col in df.columns:
+        dep_vals = sorted({str(x).strip() for x in df[dep_col].dropna().unique().tolist() if str(x).strip()})
+    with c_f2:
+        sel_dep = st.multiselect(
+            "Filtro: dependência administrativa (coluna Censo)",
+            options=dep_vals,
+            default=[],
+            key="dash_filter_dependencia",
+            disabled=not dep_vals,
+            help="Seleccione um ou mais códigos/etiquetas. Vazio = não filtrar.",
+        )
+    with c_f3:
+        faixa_lbl = st.radio(
+            "Filtro: faixa de matrícula (coluna do Censo)",
+            options=list(FAIXA_LABELS.keys()),
+            key="dash_filter_faixa_matricula",
+        )
+
+    faixa: MatriculaFaixa = FAIXA_LABELS[faixa_lbl]
+    dash_df = filter_operational_dataframe(
+        df,
+        column_map=cms,
+        match_status=sel_stat if sel_stat else None,
+        dependencia=sel_dep if sel_dep else None,
+        matricula_faixa=faixa,
+    )
+
+    kpis = compute_kpis(dash_df, cms)
+    divs = compute_divergence_counts(dash_df, cms)
+    rankings = compute_rankings(dash_df, cms, top_n=12)
+
+    g0, g1, g2, g3, g4, g5 = st.columns(6)
+    g0.metric("Linhas filtradas", f"{kpis.linhas_filtradas:,}")
+    g1.metric("Total ISS", f"{kpis.total_iss:,.2f}")
+    g2.metric("Σ matrículas (linhas)", f"{kpis.total_matriculas:,.0f}")
+    g3.metric("Escolas (CNPJ DMS distintos)", f"{kpis.total_escolas:,}")
+    g4.metric("Match exato (linhas)", f"{kpis.total_match_exato:,}")
+    g5.metric("Sem correspondência (linhas)", f"{kpis.total_sem_correspondencia:,}")
+
+    st.subheader("Painel de divergências (subconjunto filtrado)")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Sem correspondência CNPJ", f"{divs.sem_correspondencia:,}")
+    d2.metric("Múltiplas escolas / CNPJ", f"{divs.multiplas_escolas:,}")
+    d3.metric("Sem matrícula ou ≤0", f"{divs.sem_matricula:,}")
+    d4.metric("CNPJ DMS inválido", f"{divs.cnpj_invalido:,}")
+
+    st.subheader("Rankings fiscais (top 12 linhas)")
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        st.markdown("**Top ISS (valor bruto)**")
+        st.dataframe(rankings.top_iss, use_container_width=True, height=260, hide_index=True)
+    with r2:
+        st.markdown("**Top ISS / matrícula**")
+        st.dataframe(rankings.top_iss_por_matricula, use_container_width=True, height=260, hide_index=True)
+    with r3:
+        st.markdown("**Top mensalidade / aluno**")
+        st.dataframe(rankings.top_mensalidade_por_aluno, use_container_width=True, height=260, hide_index=True)
+
+    st.subheader("Gráficos")
+    gc1, gc2 = st.columns(2)
+    with gc1:
+        st.plotly_chart(
+            figure_donut_match_status(dash_df),
+            use_container_width=True,
+            key="dash_plotly_donut_match",
+        )
+    with gc2:
+        st.plotly_chart(
+            figure_bar_iss_by_status(dash_df, cms),
+            use_container_width=True,
+            key="dash_plotly_bar_iss_status",
+        )
+    st.plotly_chart(
+        figure_scatter_matriculas_iss(dash_df, cms),
+        use_container_width=True,
+        key="dash_plotly_scatter_mat_iss",
+    )
+
+    st.subheader("Tabela operacional (até 500 linhas filtradas)")
+    st.dataframe(
+        build_operational_table(dash_df, cms, max_rows=500),
+        use_container_width=True,
+        height=420,
+        hide_index=True,
+    )
+
+    if not paths.get("iss"):
+        st.warning("Coluna de **ISS** não detectada no consolidado (`dms__…`) — alguns gráficos e KPIs ficam vazios.")
+    if not paths.get("matriculas"):
+        st.warning("Coluna de **matrículas** não detectada (`censo__…`) — faixas e dispersão podem falhar.")
+
+
 def run_etapa3_merge_pipeline(
     dms_work: pd.DataFrame,
     censo_work: pd.DataFrame,
@@ -1107,6 +1265,8 @@ def run_etapa3_merge_pipeline(
         st.info(
             "Indicadores não materializados nesta sessão — verifique colunas fiscais na DMS e matrículas no Censo."
         )
+
+    render_etapa6_2_fiscal_dashboard(refinado, cm)
 
     texto_extra = st.session_state.get("etapa3_comp_text_summary")
     if texto_extra:
