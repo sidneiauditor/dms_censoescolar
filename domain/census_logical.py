@@ -59,7 +59,8 @@ CENSO_MATRICULA_FIELDS: tuple[LogicalFieldSpec, ...] = (
     ),
     LogicalFieldSpec(
         "matriculas",
-        "Quantidade ou campo agregado de matrículas (ex.: ``QT_MAT_BAS`` ou total declarado).",
+        "Total de matrículas (EB): mapear para **QT_MAT_BAS** nos microdados INEP quando existir; "
+        "o consolidador preserva também o nome oficial ``QT_MAT_BAS`` na base final.",
         obrigatorio_matricula=True,
     ),
 )

@@ -47,9 +47,9 @@ COL_BASE_CALC_ALIASES: tuple[str, ...] = (
     "BCALCULO",
 )
 COL_MATRICULAS_ALIASES: tuple[str, ...] = (
+    "QT_MAT_BAS",
     "matriculas",
     "MATRICULAS",
-    "QT_MAT_BAS",
     "TOTAL_MATRICULAS",
     "QT_TOTAL_MATRICULAS",
 )

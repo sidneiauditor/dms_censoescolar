@@ -13,6 +13,7 @@ Arquitetura (UX atual):
   a aplicar ``add_normalized_cnpj_column`` usando o consolidado + resoluções automáticas (ex.: ``CNPJ_base_escola``).
 - **Etapa 3** — merge determinístico por CNPJ; RapidFuzz opcional só sem CNPJ DMS válido.
 - **Etapa 6.1** — indicadores fiscais básicos (ISS, mensalidade, base de cálculo por matrícula) no consolidado — ver :mod:`services.indicators`.
+- **Etapa 8.1** — agregação semântica por **CNPJ**: soma ``QT_MAT_BAS`` (Censo oficial EB) e ``QUANTIDADE``/ISS por contribuinte antes do painel Salvador — :mod:`services.census_semantics`, :mod:`services.cnpj_aggregation`, :mod:`services.enrollment_divergence`.
 - **Etapa 6.2** — modo **técnico**: filtros + rankings + gráficos em :mod:`services.dashboard_metrics` / :mod:`ui.dashboard`;
   modo **operacional Salvador**: painel só de divergências de matrículas em :mod:`services.enrollment_divergence` /
   :mod:`ui.operacional_dashboard`.
@@ -1298,7 +1299,14 @@ def _render_operacional_dashboard_download() -> None:
     if not isinstance(df_op, pd.DataFrame):
         st.info("Ainda não há **base integrada** nesta sessão — use **Arquivos e processamento** para carregar e processar.")
         return
-    render_operacional_enrollment_dashboard(df_op, cm_op)
+    render_operacional_enrollment_dashboard(
+        df_op,
+        cm_op,
+        dms_work=st.session_state.get("dms_work") if isinstance(st.session_state.get("dms_work"), pd.DataFrame) else None,
+        censo_work=st.session_state.get("censo_work")
+        if isinstance(st.session_state.get("censo_work"), pd.DataFrame)
+        else None,
+    )
     buf = io.BytesIO()
     df_op.to_excel(buf, index=False, engine="openpyxl")
     st.download_button(
