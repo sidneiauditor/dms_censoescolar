@@ -46,6 +46,15 @@ def _valid_norm_mask(s: pd.Series) -> pd.Series:
     return t.str.len().eq(14) & t.str.isdigit()
 
 
+# Dependência administrativa do Censo Escolar
+_DEPENDENCIA_ALIASES: tuple[str, ...] = (
+    "TP_DEPENDENCIA",
+    "DEPENDENCIA",
+    "DEPENDENCIA_ADMINISTRATIVA",
+)
+TP_DEPENDENCIA_PRIVADA: int = 4  # 1=Federal 2=Estadual 3=Municipal 4=Privada
+
+
 def _resolve_dms_quantity_column(dms_df: pd.DataFrame, column_map: dict[str, Any]) -> str | None:
     cm = column_map or {}
     pick = cm.get("dms_qtd")
@@ -206,6 +215,7 @@ def aggregate_census_by_cnpj(
     *,
     col_cnpj_norm: str = CNPJ_NORM_COL_CENSO,
     co_entidade_column: str | None = None,
+    only_private: bool = False,
 ) -> pd.DataFrame:
     """
     Uma linha por CNPJ normalizado (14 dígitos): soma **apenas** ``QT_MAT_BAS``.
@@ -217,6 +227,24 @@ def aggregate_census_by_cnpj(
         return pd.DataFrame(
             columns=[INTERNAL_CNPJ, AGG_MC, AGG_N_ESCOLAS_CENSO],
         )
+
+    if only_private:
+        dep_col = _resolve_first_alias(censo_df, _DEPENDENCIA_ALIASES)
+        if dep_col and dep_col in censo_df.columns:
+            dep_num = pd.to_numeric(censo_df[dep_col], errors="coerce")
+            n_antes = len(censo_df)
+            censo_df = censo_df.loc[dep_num == TP_DEPENDENCIA_PRIVADA]
+            LOG.info(
+                "aggregate_census_by_cnpj: only_private=True → %d→%d linhas (excluídas %d públicas)",
+                n_antes,
+                len(censo_df),
+                n_antes - len(censo_df),
+            )
+        else:
+            LOG.warning(
+                "aggregate_census_by_cnpj: only_private=True mas TP_DEPENDENCIA não encontrada"
+                " no Censo — sem filtro aplicado."
+            )
 
     qt_col = physical_qt_mat_bas_column(censo_df.columns)
     if not qt_col or qt_col not in censo_df.columns:

@@ -40,10 +40,21 @@ def render_operacional_enrollment_dashboard(
     )
     granularity: Granularity = GRANULARITY_ESTABLISHMENT if choice.startswith("Estabelecimento") else GRANULARITY_ROOT
 
+    only_private = st.checkbox(
+        "Apenas rede privada (exclui públicas do Censo)",
+        value=True,
+        key="cif_ops_only_private_censo",
+        help=(
+            "Quando marcado, escolas com TP_DEPENDENCIA ≠ 4 (federais, estaduais, municipais) "
+            "são removidas do Censo antes do cruzamento — eliminando omissões ilegítimas de ISS."
+        ),
+    )
+
     kw = {
         "reference_year": ref_year,
         "use_reference_month": True,
         "reference_month": 5,
+        "only_private_censo": only_private,
     }
 
     kpis = compute_enrollment_kpis(
@@ -84,6 +95,13 @@ def render_operacional_enrollment_dashboard(
     _, merge_meta = get_merged_aggregate_for_audits(
         df, cm, dms_work=dms_work, censo_work=censo_work, granularity=granularity, **kw
     )
+    if only_private and isinstance(merge_meta, dict):
+        n_privadas = merge_meta.get("n_privadas_censo")
+        if isinstance(n_privadas, int):
+            st.caption(
+                f"Censo filtrado: **{n_privadas:,}** escolas privadas "
+                f"(TP_DEPENDENCIA = 4). Públicas excluídas do cruzamento."
+            )
     ref_month_meta = merge_meta.get("ref_month_meta") if isinstance(merge_meta.get("ref_month_meta"), dict) else {}
     st.session_state["ref_month_meta"] = ref_month_meta
 

@@ -188,6 +188,7 @@ def merged_aggregate_internal(
     reference_year: int | None = None,
     use_reference_month: bool = True,
     reference_month: int = 5,
+    only_private_censo: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     cm = dict(column_map or {})
     use_frames = (
@@ -213,8 +214,29 @@ def merged_aggregate_internal(
                 reference_year=reference_year,
             )
 
+        if only_private_censo and isinstance(censo_work, pd.DataFrame):
+            dep_col_ui = next(
+                (
+                    c
+                    for c in censo_work.columns
+                    if str(c).strip().upper() in ("TP_DEPENDENCIA", "DEPENDENCIA")
+                ),
+                None,
+            )
+            if dep_col_ui:
+                dep_mask = pd.to_numeric(censo_work[dep_col_ui], errors="coerce") == 4
+                n_privadas_ui = int(dep_mask.sum())
+            else:
+                n_privadas_ui = len(censo_work)
+        else:
+            n_privadas_ui = len(censo_work) if isinstance(censo_work, pd.DataFrame) else 0
+
         if granularity == GRANULARITY_ROOT:
-            c_agg = aggregate_census_by_cnpj_root(censo_work, co_entidade_column=co_ent)
+            c_agg = aggregate_census_by_cnpj_root(
+                censo_work,
+                co_entidade_column=co_ent,
+                only_private=only_private_censo,
+            )
             d_agg = aggregate_dms_by_cnpj_root(dms_for_agg, column_map=cm)
             merged = merge_root_aggregates(d_agg, c_agg, how="outer")
             return merged, {
@@ -223,9 +245,15 @@ def merged_aggregate_internal(
                 "co_entidade_column_physical": co_ent,
                 "granularity": granularity,
                 "ref_month_meta": ref_month_meta,
+                "only_private_censo": only_private_censo,
+                "n_privadas_censo": n_privadas_ui,
             }
 
-        c_agg = aggregate_census_by_cnpj(censo_work, co_entidade_column=co_ent)
+        c_agg = aggregate_census_by_cnpj(
+            censo_work,
+            co_entidade_column=co_ent,
+            only_private=only_private_censo,
+        )
         d_agg, agg_ref_meta = aggregate_dms_by_cnpj(
             dms_for_agg,
             column_map=cm,
@@ -240,6 +268,8 @@ def merged_aggregate_internal(
             "co_entidade_column_physical": co_ent,
             "granularity": granularity,
             "ref_month_meta": ref_month_meta,
+            "only_private_censo": only_private_censo,
+            "n_privadas_censo": n_privadas_ui,
         }
 
     return _fallback_merged_from_consolidado(consolidado_df, cm, granularity=granularity)
@@ -388,6 +418,7 @@ def compute_enrollment_kpis(
     reference_year: int | None = None,
     use_reference_month: bool = True,
     reference_month: int = 5,
+    only_private_censo: bool = True,
 ) -> EnrollmentDivergenceKpis:
     merged, _meta = merged_aggregate_internal(
         df,
@@ -398,6 +429,7 @@ def compute_enrollment_kpis(
         reference_year=reference_year,
         use_reference_month=use_reference_month,
         reference_month=reference_month,
+        only_private_censo=only_private_censo,
     )
     return compute_enrollment_kpis_from_merged(merged, granularity=granularity)
 
@@ -412,6 +444,7 @@ def build_enrollment_divergence_table(
     reference_year: int | None = None,
     use_reference_month: bool = True,
     reference_month: int = 5,
+    only_private_censo: bool = True,
 ) -> pd.DataFrame:
     merged, _meta = merged_aggregate_internal(
         df,
@@ -422,6 +455,7 @@ def build_enrollment_divergence_table(
         reference_year=reference_year,
         use_reference_month=use_reference_month,
         reference_month=reference_month,
+        only_private_censo=only_private_censo,
     )
     return _presentation_columns(merged, granularity=granularity)
 
@@ -436,6 +470,7 @@ def get_merged_aggregate_for_audits(
     reference_year: int | None = None,
     use_reference_month: bool = True,
     reference_month: int = 5,
+    only_private_censo: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Expõe o quadro agregado interno para exploratórios (ex.: QUANTIDADE) sem recalcular merges."""
 
@@ -448,6 +483,7 @@ def get_merged_aggregate_for_audits(
         reference_year=reference_year,
         use_reference_month=use_reference_month,
         reference_month=reference_month,
+        only_private_censo=only_private_censo,
     )
 
 
@@ -461,6 +497,7 @@ def describe_column_bindings(
     reference_year: int | None = None,
     use_reference_month: bool = True,
     reference_month: int = 5,
+    only_private_censo: bool = True,
 ) -> dict[str, str | None]:
     cm = dict(column_map or {})
     paths_cons = resolved_paths_for_dashboard(consolidado_df, cm)
@@ -474,6 +511,7 @@ def describe_column_bindings(
         reference_year=reference_year,
         use_reference_month=use_reference_month,
         reference_month=reference_month,
+        only_private_censo=only_private_censo,
     )
 
     out: dict[str, str | None] = {

@@ -6,8 +6,11 @@ import pandas as pd
 import pytest
 
 from services.cnpj_aggregation import (
+    AGG_MC,
     AGG_QTY,
+    CNPJ_NORM_COL_CENSO,
     CNPJ_NORM_COL_DMS,
+    aggregate_census_by_cnpj,
     aggregate_dms_by_cnpj,
     filter_dms_to_reference_month,
 )
@@ -103,3 +106,18 @@ def test_aggregate_dms_monthly_vs_annual():
     annual, _ = aggregate_dms_by_cnpj(df, use_reference_month=False)
     assert float(monthly[AGG_QTY].iloc[0]) == 100.0
     assert float(annual[AGG_QTY].iloc[0]) == 120.0
+
+
+def test_aggregate_census_only_private():
+    df = pd.DataFrame(
+        {
+            CNPJ_NORM_COL_CENSO: ["11111111000191", "22222222000100"],
+            "TP_DEPENDENCIA": [3, 4],
+            "QT_MAT_BAS": [100, 50],
+        }
+    )
+    all_agg = aggregate_census_by_cnpj(df, only_private=False)
+    priv_agg = aggregate_census_by_cnpj(df, only_private=True)
+    assert len(all_agg) == 2
+    assert len(priv_agg) == 1
+    assert float(priv_agg[AGG_MC].iloc[0]) == 50.0
