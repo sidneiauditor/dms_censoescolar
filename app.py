@@ -13,7 +13,7 @@ Arquitetura (UX atual):
   a aplicar ``add_normalized_cnpj_column`` usando o consolidado + resoluções automáticas (ex.: ``CNPJ_base_escola``).
 - **Etapa 3** — merge determinístico por CNPJ; RapidFuzz opcional só sem CNPJ DMS válido.
 - **Etapa 6.1** — indicadores fiscais básicos (ISS, mensalidade, base de cálculo por matrícula) no consolidado — ver :mod:`services.indicators`.
-- **Etapa 8.1** — agregação semântica por **CNPJ**: soma ``QT_MAT_BAS`` (Censo oficial EB) e ``QUANTIDADE``/ISS por contribuinte antes do painel Salvador — :mod:`services.census_semantics`, :mod:`services.cnpj_aggregation`, :mod:`services.enrollment_divergence`.
+- **Etapa 8.2** — opcional no painel Salvador: agregação por **raiz do CNPJ** (8 dígitos) e exploração descritiva do campo ``QUANTIDADE`` — :mod:`services.cnpj_root_aggregation`, :mod:`services.dms_quantidade_exploration`.
 - **Etapa 6.2** — modo **técnico**: filtros + rankings + gráficos em :mod:`services.dashboard_metrics` / :mod:`ui.dashboard`;
   modo **operacional Salvador**: painel só de divergências de matrículas em :mod:`services.enrollment_divergence` /
   :mod:`ui.operacional_dashboard`.
@@ -69,10 +69,11 @@ from services.inferred_mapping import (
     propose_matricula_mapping,
     resolve_census_cnpj_physical_column,
 )
+from services.cnpj_root_aggregation import CNPJ_RAIZ_COL, dataframe_with_cnpj_raiz
 from services.municipality_filter import filter_escola_by_municipality, restrict_matricula_to_entidades
 from services.table_loader import load_dataset_bundle, spinner_message
 from services.text_fuzzy_merge import run_textual_fuzzy_merge
-from utils.cnpj import add_normalized_cnpj_column, summarize_cnpj_column
+from utils.cnpj import add_normalized_cnpj_column, normalize_cnpj_digits, summarize_cnpj_column
 from utils.file_io import FileValidationError
 
 from cif_geo_salvador import ROTULO_SALVADOR_CURTO, construir_geo_context_salvador
@@ -1433,6 +1434,8 @@ def _executar_pipeline_operacional(
     if rebuilt is None:
         return False
     dms_work_ready, censo_work_ready, cm_new = rebuilt
+    dms_work_ready = dataframe_with_cnpj_raiz(dms_work_ready, "__cnpj_norm_dms")
+    censo_work_ready = dataframe_with_cnpj_raiz(censo_work_ready, "__cnpj_norm_censo")
     st.session_state["column_map"] = cm_new
     st.session_state["dms_work"] = dms_work_ready
     st.session_state["censo_work"] = censo_work_ready
@@ -1477,6 +1480,12 @@ def _executar_pipeline_operacional(
         return False
 
     consolidado_cnpj, _report61 = add_basic_fiscal_indicators(consolidado_cnpj, dict(cm_new))
+    pref_dms_cnpj = f"dms__{col_dms_raw}"
+    if pref_dms_cnpj in consolidado_cnpj.columns:
+        cc = consolidado_cnpj.copy()
+        norms = cc[pref_dms_cnpj].map(normalize_cnpj_digits)
+        cc[CNPJ_RAIZ_COL] = norms.map(lambda x: x[:8] if isinstance(x, str) and len(x) == 14 else "")
+        consolidado_cnpj = cc
     st.session_state["consolidado_df"] = consolidado_cnpj
     st.session_state.pop("consolidado_summary", None)
     st.session_state["etapa3_cnpj_summary"] = summary_cnpj
@@ -1969,6 +1978,8 @@ def _maybe_continue_dms_etapas(
         return
 
     dms_work_ready, censo_work_ready, cm_new = rebuilt
+    dms_work_ready = dataframe_with_cnpj_raiz(dms_work_ready, "__cnpj_norm_dms")
+    censo_work_ready = dataframe_with_cnpj_raiz(censo_work_ready, "__cnpj_norm_censo")
     st.session_state["column_map"] = cm_new
     st.session_state["dms_work"] = dms_work_ready
     st.session_state["censo_work"] = censo_work_ready

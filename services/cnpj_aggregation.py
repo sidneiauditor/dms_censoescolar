@@ -1,10 +1,8 @@
 """
 Agregação **por CNPJ** (Etapa 8.1) para alinhar granularidade fiscal (DMS) e pedagógica (Censo).
 
-A linha-analítica do painel operacional compara apenas totais já agregados:
-
-- ``SUM(DMS.QUANTIDADE)`` (e somas de ISS/base) por contribuinte;
-- ``SUM(Censo.QT_MAT_BAS)`` por CNPJ (total oficial de Educação Básica no extracto municipal).
+**Etapa 8.2** — :func:`filter_dms_to_reference_month` restringe ``QUANTIDADE`` ao mês de referência
+(maio por defeito) antes de somar por CNPJ, tornando o cruzamento comparável a ``QT_MAT_BAS``.
 """
 
 from __future__ import annotations
@@ -32,6 +30,16 @@ AGG_MC = "_agg_mat_censo_bas"
 AGG_RAZAO = "_agg_razao"
 AGG_N_ESCOLAS_CENSO = "_agg_n_escolas_censo"
 
+DMS_COMPETENCIA_ALIASES: tuple[str, ...] = (
+    "DTCOMPETENCIA",
+    "DT_COMPETENCIA",
+    "COMPETENCIA",
+    "MES_COMPETENCIA",
+    "DT_COMPET",
+)
+DMS_TIPO_ALIASES: tuple[str, ...] = ("TIPO", "TP_DOCUMENTO", "TP_DOC", "TIPO_DOCUMENTO")
+DMS_SITUACAO_ALIASES: tuple[str, ...] = ("SITUACAO", "SITUACAO_NF", "STATUS", "SIT_NF")
+
 
 def _valid_norm_mask(s: pd.Series) -> pd.Series:
     t = s.astype(str).str.strip()
@@ -56,6 +64,141 @@ def _resolve_first_alias(dms_df: pd.DataFrame, aliases: tuple[str, ...]) -> str 
         if u in cols_upper:
             return cols_upper[u]
     return None
+
+
+def _resolve_dms_competencia_column(dms_df: pd.DataFrame, column_map: dict[str, Any]) -> str | None:
+    cm = column_map or {}
+    pick = cm.get("dms_competencia")
+    if isinstance(pick, str) and pick.strip() and pick in dms_df.columns:
+        return pick
+    return _resolve_first_alias(dms_df, DMS_COMPETENCIA_ALIASES)
+
+
+def _dms_valid_launch_mask(
+    work: pd.DataFrame,
+    tipo_col: str | None,
+    situacao_col: str | None,
+) -> pd.Series:
+    """Exclui retificadoras e canceladas quando as colunas existem."""
+
+    mask = pd.Series(True, index=work.index)
+    if tipo_col and tipo_col in work.columns:
+        tipo = work[tipo_col].astype(str).str.strip().str.upper()
+        mask &= tipo.ne("RETIFICADORA")
+    if situacao_col and situacao_col in work.columns:
+        sit = work[situacao_col].astype(str).str.strip().str.upper()
+        mask &= sit.ne("CANCELADA")
+    return mask
+
+
+def filter_dms_to_reference_month(
+    dms_df: pd.DataFrame,
+    *,
+    column_map: dict[str, Any] | None = None,
+    col_cnpj_norm: str = CNPJ_NORM_COL_DMS,
+    reference_month: int = 5,
+    reference_year: int | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Por CNPJ, mantém lançamentos do mês de referência (maio por defeito) no ano de exercício.
+
+    Se não houver maio, recua até janeiro. CNPJs sem mês válido ficam de fora do resultado.
+    """
+
+    cm = dict(column_map or {})
+    base_meta: dict[str, Any] = {
+        "reference_month_used": int(reference_month),
+        "reference_year": reference_year,
+        "cnpjs_com_maio": 0,
+        "cnpjs_com_fallback": 0,
+        "cnpjs_sem_competencia": 0,
+        "coluna_competencia_nao_encontrada": False,
+        "fallback_detail": pd.DataFrame(columns=["cnpj_norm", "mes_referencia_usado", "motivo"]),
+    }
+
+    if dms_df.empty:
+        return dms_df.copy(), base_meta
+
+    comp_col = _resolve_dms_competencia_column(dms_df, cm)
+    if not comp_col or comp_col not in dms_df.columns:
+        out_meta = dict(base_meta)
+        out_meta["coluna_competencia_nao_encontrada"] = True
+        LOG.warning("filter_dms_to_reference_month: sem coluna de competência — soma anual legada.")
+        return dms_df.copy(), out_meta
+
+    if col_cnpj_norm not in dms_df.columns:
+        return dms_df.copy(), base_meta
+
+    tipo_col = _resolve_first_alias(dms_df, DMS_TIPO_ALIASES)
+    sit_col = _resolve_first_alias(dms_df, DMS_SITUACAO_ALIASES)
+
+    work = dms_df.loc[_valid_norm_mask(dms_df[col_cnpj_norm])].copy()
+    if work.empty:
+        return work, base_meta
+
+    work["_dt"] = pd.to_datetime(work[comp_col], errors="coerce")
+    work = work.loc[work["_dt"].notna()].copy()
+    if work.empty:
+        return work, base_meta
+
+    year_use = int(reference_year) if reference_year is not None else int(work["_dt"].dt.year.max())
+    base_meta["reference_year"] = year_use
+
+    work = work.loc[work["_dt"].dt.year == year_use].copy()
+    if work.empty:
+        return work, base_meta
+
+    work["_month"] = work["_dt"].dt.month.astype(int)
+    work["_cnpj"] = work[col_cnpj_norm].astype(str).str.strip()
+
+    work_valid = work.loc[_dms_valid_launch_mask(work, tipo_col, sit_col)].copy()
+
+    selected_indices: list[Any] = []
+    fallback_rows: list[dict[str, object]] = []
+    cnpjs_com_maio = 0
+    cnpjs_com_fallback = 0
+    cnpjs_sem = 0
+    ref_m = int(reference_month)
+
+    for cnpj, grp in work_valid.groupby("_cnpj", sort=False):
+        months_present = {int(m) for m in grp["_month"].dropna().tolist()}
+        chosen: int | None = None
+        for m in range(ref_m, 0, -1):
+            if m in months_present:
+                chosen = m
+                break
+        if chosen is None:
+            cnpjs_sem += 1
+            continue
+
+        selected_indices.extend(grp.loc[grp["_month"] == chosen].index.tolist())
+        if chosen == ref_m:
+            cnpjs_com_maio += 1
+            motivo = "maio_disponivel"
+        else:
+            cnpjs_com_fallback += 1
+            motivo = f"fallback_mes_{chosen}"
+        fallback_rows.append({"cnpj_norm": cnpj, "mes_referencia_usado": chosen, "motivo": motivo})
+
+    filtered = dms_df.loc[selected_indices].copy() if selected_indices else dms_df.iloc[0:0].copy()
+
+    meta = dict(base_meta)
+    meta["cnpjs_com_maio"] = cnpjs_com_maio
+    meta["cnpjs_com_fallback"] = cnpjs_com_fallback
+    meta["cnpjs_sem_competencia"] = cnpjs_sem
+    meta["fallback_detail"] = pd.DataFrame(fallback_rows)
+
+    LOG.info(
+        "filter_dms_to_reference_month: ano=%s ref_m=%s linhas %s→%s maio=%s fallback=%s sem=%s",
+        year_use,
+        ref_m,
+        len(dms_df.index),
+        len(filtered.index),
+        cnpjs_com_maio,
+        cnpjs_com_fallback,
+        cnpjs_sem,
+    )
+    return filtered, meta
 
 
 def aggregate_census_by_cnpj(
@@ -116,29 +259,41 @@ def aggregate_dms_by_cnpj(
     *,
     col_cnpj_norm: str = CNPJ_NORM_COL_DMS,
     column_map: dict[str, Any] | None = None,
-) -> pd.DataFrame:
+    use_reference_month: bool = True,
+    reference_month: int = 5,
+    reference_year: int | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """
-    Uma linha por CNPJ: soma ``QUANTIDADE``, ``VLIMPOSTO``, ``VLBASECALCULO`` (aliases em :mod:`services.indicators`).
-    Inclui rótulo de razão social (primeiro valor não vazio por grupo).
-    """
+    Uma linha por CNPJ: soma ``QUANTIDADE``, ``VLIMPOSTO``, ``VLBASECALCULO``.
 
-    if dms_df.empty or col_cnpj_norm not in dms_df.columns:
-        return pd.DataFrame(
-            columns=[INTERNAL_CNPJ, AGG_QTY, AGG_ISS, AGG_BASE, AGG_RAZAO],
+    Com ``use_reference_month=True`` (padrão), aplica :func:`filter_dms_to_reference_month` antes da soma.
+  """
+
+    ref_meta: dict[str, Any] = {}
+    work_source = dms_df
+    if use_reference_month and not dms_df.empty:
+        work_source, ref_meta = filter_dms_to_reference_month(
+            dms_df,
+            column_map=dict(column_map or {}),
+            col_cnpj_norm=col_cnpj_norm,
+            reference_month=reference_month,
+            reference_year=reference_year,
         )
 
-    qty_col = _resolve_dms_quantity_column(dms_df, dict(column_map or {}))
-    iss_col = _resolve_first_alias(dms_df, COL_ISS_ALIASES)
-    base_col = _resolve_first_alias(dms_df, COL_BASE_CALC_ALIASES)
-    dm_prop = propose_dms_mapping([str(c) for c in dms_df.columns])
-    raz_phys = dm_prop.get("razao_social")
-    raz_col = None
-    if raz_phys and raz_phys in dms_df.columns:
-        raz_col = raz_phys
+    empty_cols = [INTERNAL_CNPJ, AGG_QTY, AGG_ISS, AGG_BASE, AGG_RAZAO]
+    if work_source.empty or col_cnpj_norm not in work_source.columns:
+        return pd.DataFrame(columns=empty_cols), ref_meta
 
-    work = dms_df.loc[_valid_norm_mask(dms_df[col_cnpj_norm])].copy()
+    qty_col = _resolve_dms_quantity_column(work_source, dict(column_map or {}))
+    iss_col = _resolve_first_alias(work_source, COL_ISS_ALIASES)
+    base_col = _resolve_first_alias(work_source, COL_BASE_CALC_ALIASES)
+    dm_prop = propose_dms_mapping([str(c) for c in work_source.columns])
+    raz_phys = dm_prop.get("razao_social")
+    raz_col = raz_phys if raz_phys and raz_phys in work_source.columns else None
+
+    work = work_source.loc[_valid_norm_mask(work_source[col_cnpj_norm])].copy()
     if work.empty:
-        return pd.DataFrame(columns=[INTERNAL_CNPJ, AGG_QTY, AGG_ISS, AGG_BASE, AGG_RAZAO])
+        return pd.DataFrame(columns=empty_cols), ref_meta
 
     work[INTERNAL_CNPJ] = work[col_cnpj_norm].astype(str).str.strip()
 
@@ -178,7 +333,7 @@ def aggregate_dms_by_cnpj(
             AGG_RAZAO: raz_series.to_numpy(),
         }
     )
-    return out.reset_index(drop=True)
+    return out.reset_index(drop=True), ref_meta
 
 
 def merge_aggregates_by_cnpj(

@@ -57,6 +57,7 @@ DMS_ALIASES: dict[str, tuple[str, ...]] = {
     "CNPJ": ("CNPJ", "NU_CNPJ", "DOCUMENTO"),
     "razao_social": ("NMRAZAOSOCIAL", "RAZAOSOCIAL", "NM_RAZAO_SOCIAL"),
     "quantidade": ("QUANTIDADE", "QTDE", "QTD_ALUNOS", "QTD", "TOTAL"),
+    "competencia": ("DTCOMPETENCIA", "DT_COMPETENCIA", "COMPETENCIA", "MES_COMPETENCIA"),
 }
 
 
