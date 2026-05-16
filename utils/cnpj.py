@@ -109,10 +109,26 @@ def add_normalized_cnpj_column(
 ) -> pd.DataFrame:
     """Adiciona coluna apenas com dígitos normalizados (14 dígitos) onde aplicável; vazio caso contrário."""
 
+    logger.info(
+        "add_normalized_cnpj_column [antes]: rows=%s ncols=%s source_col=%r out_col=%r source_present=%s",
+        len(df.index),
+        len(df.columns),
+        source_col,
+        out_col,
+        source_col in df.columns,
+    )
+
     def _norm(v: object) -> str:
         n = normalize_cnpj_digits(v)
         return n if n is not None else ""
 
     result = df.copy()
     result[out_col] = result[source_col].map(_norm)
+    filled = int((result[out_col].astype(str).str.strip() != "").sum())
+    logger.info(
+        "add_normalized_cnpj_column [depois]: out_col=%r dtype=%s linhas_com_norm_nao_vazia=%s",
+        out_col,
+        result[out_col].dtype,
+        filled,
+    )
     return result

@@ -603,6 +603,106 @@ def default_select_index(options: list[str], preferred: str | None) -> int:
     return 0
 
 
+def _series_nonempty_cell_count(series: pd.Series) -> int:
+    """Células com conteúdo utilizável (não NaN, não vazio após strip, não placeholder textual)."""
+
+    mask = series.notna()
+    strv = series.astype(str).str.strip()
+    mask &= strv.ne("") & ~strv.str.lower().isin(["nan", "none"])
+    return int(mask.sum())
+
+
+def render_etapa3_premerge_diagnostics(
+    dms_work: pd.DataFrame,
+    censo_work: pd.DataFrame,
+    cm: dict[str, Any],
+) -> None:
+    """Inspeção explícita das bases de trabalho antes do merge determinístico."""
+
+    with st.expander(
+        "**Diagnóstico pré-merge** — dados entregues à Etapa 3",
+        expanded=True,
+    ):
+        st.markdown("##### Colunas em `dms_work`")
+        st.code("\n".join(map(str, dms_work.columns)), language="text")
+        st.caption(
+            f"**{len(dms_work.columns)}** colunas · **{len(dms_work.index):,}** linhas · "
+            f"`__cnpj_norm_dms` presente: **{'sim' if '__cnpj_norm_dms' in dms_work.columns else 'não'}**"
+        )
+
+        st.markdown("##### Colunas em `censo_work`")
+        st.code("\n".join(map(str, censo_work.columns)), language="text")
+        st.caption(
+            f"**{len(censo_work.columns)}** colunas · **{len(censo_work.index):,}** linhas · "
+            f"`__cnpj_norm_censo` presente: **{'sim' if '__cnpj_norm_censo' in censo_work.columns else 'não'}**"
+        )
+
+        col_censo_fis = cm.get("censo_cnpj")
+        st.markdown("##### CNPJ do Censo — coluna física e preenchimento")
+        if (
+            isinstance(col_censo_fis, str)
+            and col_censo_fis.strip()
+            and col_censo_fis != SELECT_SENTINEL
+        ):
+            st.write(f"**`column_map.censo_cnpj`:** `{col_censo_fis}`")
+            if col_censo_fis in censo_work.columns:
+                raw = censo_work[col_censo_fis]
+                n_nonempty = _series_nonempty_cell_count(raw)
+                st.metric(
+                    "Valores não vazios (célula com texto)",
+                    f"{n_nonempty:,} / {len(raw):,}",
+                )
+            else:
+                st.warning(
+                    f"A coluna **`{col_censo_fis}`** está no mapeamento mas **não existe** em `censo_work`. "
+                    "Causas prováveis: consolidado desatualizado após alterar o Censo ou os mapeamentos INEP; "
+                    "renomeação de colunas na consolidação; ou ficheiro de escolas diferente. "
+                    "**Reconsolide** o Censo no passo anterior ou confira os nomes listados acima."
+                )
+        else:
+            st.info(
+                "O CNPJ físico do Censo **não está definido** em `column_map` (Etapa 2). "
+                "Sem isso, o fluxo não fixa a coluna-fonte para normalização."
+            )
+
+        st.markdown("##### Coluna interna `__cnpj_norm_censo`")
+        if "__cnpj_norm_censo" in censo_work.columns:
+            s_norm = censo_work["__cnpj_norm_censo"]
+            n_filled = int(
+                (s_norm.fillna("").astype(str).str.strip().ne("")).sum()
+            )
+            st.success("A coluna **`__cnpj_norm_censo`** existe neste `DataFrame`.")
+            st.write(f"- **dtype:** `{s_norm.dtype}`")
+            st.metric(
+                "Linhas com normalização não vazia (após extrair dígitos)",
+                f"{n_filled:,} / {len(censo_work.index):,}",
+            )
+            if (
+                isinstance(col_censo_fis, str)
+                and col_censo_fis.strip()
+                and col_censo_fis != SELECT_SENTINEL
+                and col_censo_fis in censo_work.columns
+            ):
+                preview = censo_work[
+                    [col_censo_fis, "__cnpj_norm_censo"]
+                ].head(25)
+                st.markdown("**Pré-visualização:** CNPJ original × `__cnpj_norm_censo` (até 25 linhas)")
+                st.dataframe(preview, use_container_width=True, hide_index=True)
+            else:
+                st.caption(
+                    "Pré-visualização lado a lado indisponível: coluna física do Censo em falta ou inválida no `column_map`."
+                )
+        else:
+            st.warning(
+                "**`__cnpj_norm_censo` não existe** neste `DataFrame`. Causas prováveis:\n\n"
+                "- A Etapa 2 não ficou com um **par CNPJ válido** (DMS + Censo) ou os `selectbox` ainda estão no sentinel.\n"
+                "- O passo `ensure_normalized_cnpj_workframes` não correu **depois** da Etapa 2 *ou* falhou ao resolver a "
+                "coluna física no consolidado (ex.: `CNPJ` vs `CNPJ_base_escola`).\n"
+                "- O consolidado foi **alterado ou invalidado** (ficheiros, município, exercício) sem reexecutar o encadeamento.\n\n"
+                "Corrija na **Etapa 2**, **consolide** de novo o Censo se mudou o contexto, e recarregue a DMS se necessário."
+            )
+
+
 def run_etapa3_merge_pipeline(
     dms_work: pd.DataFrame,
     censo_work: pd.DataFrame,
@@ -637,6 +737,8 @@ def run_etapa3_merge_pipeline(
             )
 
     cm = st.session_state.get("column_map") or {}
+    render_etapa3_premerge_diagnostics(dms_work, censo_work, cm)
+
     col_dms_raw = cm.get("dms_cnpj")
 
     opts_dms = column_options(dms_work)
@@ -651,27 +753,30 @@ def run_etapa3_merge_pipeline(
         "__cnpj_norm_censo" in censo_work.columns,
     )
 
+    merge_bloqueado = False
     if not col_dms_raw or col_dms_raw == SELECT_SENTINEL:
         st.error("Finalize a Etapa 2 definindo explicitamente as colunas de CNPJ DMS.")
-        return
-    if "__cnpj_norm_dms" not in dms_work.columns:
+        merge_bloqueado = True
+    elif "__cnpj_norm_dms" not in dms_work.columns:
         st.error(
             "Falta ``__cnpj_norm_dms`` na DMS transformada — a normalização deveria aplicar‑se assim que as colunas "
             "CNPJ forem válidas. Recarregue os ficheiros ou limpe cache e gere novamente a Etapa 2."
         )
-        return
-    if "__cnpj_norm_censo" not in censo_work.columns:
+        merge_bloqueado = True
+    elif "__cnpj_norm_censo" not in censo_work.columns:
         st.error(
-            "Falta ``__cnpj_norm_censo`` na base municipal de trabalho — o passo de normalização deveria ter corrido "
-            "logo após a Etapa 2. Volte a carregar ficheiros ou use **Clear cache** e reconsolide."
+            "**Merge indisponível:** falta ``__cnpj_norm_censo`` na base municipal de trabalho. "
+            "Consulte o **diagnóstico pré-merge** acima para causas prováveis e passos de correção."
         )
-        return
+        merge_bloqueado = True
 
-    det_clicked = st.button(
-        "Executar merge determinístico (CNPJ 14 dígitos)",
-        type="primary",
-        key="btn_etapa3_merge_cnpj",
-    )
+    det_clicked = False
+    if not merge_bloqueado:
+        det_clicked = st.button(
+            "Executar merge determinístico (CNPJ 14 dígitos)",
+            type="primary",
+            key="btn_etapa3_merge_cnpj",
+        )
 
     if det_clicked:
         prog = st.progress(0)
@@ -715,6 +820,14 @@ def run_etapa3_merge_pipeline(
         except Exception as exc:  # pylint: disable=broad-except
             st.warning(f"Escrita opcional falhou (pode sempre descarregar): {exc}")
             LOG.exception("Falha consolidado deterministic write")
+
+    if merge_bloqueado:
+        st.info(
+            "O merge determinístico **não está disponível** até existirem as colunas internas "
+            "``__cnpj_norm_dms`` e ``__cnpj_norm_censo`` nos `DataFrame` de trabalho. "
+            "Corrija conforme o **diagnóstico pré-merge** e a Etapa 2."
+        )
+        return
 
     sdet = st.session_state.get("etapa3_det_sig")
 
