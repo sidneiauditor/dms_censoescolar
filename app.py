@@ -9,7 +9,8 @@ Arquitetura (UX atual):
 - **Consolidação** — apenas escolas do município (por defeito) ⊕ Matrícula recortada ao mesmo conjunto de
   ``CO_ENTIDADE`` quando possível; colunas lógicas estáveis no resultado.
 - **Etapa 2** — vínculo DMS ↔ Censo municipal já “pensado”: CNPJ, nome, matrículas onde existirem.
-- **Etapa 3** — matching textual RapidFuzz entre DMS e Censo consolidado.
+- **Etapa 3** — **merge determinístico por CNPJ** como chave; RapidFuzz só opcional/complementar nas linhas da
+  DMS **sem** CNPJ utilizável → menos falsos positivos.
 """
 
 from __future__ import annotations
@@ -33,6 +34,19 @@ from services.census_consolidator import (
     CensusMergeError,
     consolidate_census_escolar,
     normalize_co_entidade,
+)
+from services.cnpj_merge import (
+    MATCH_CNPJ_EXATO,
+    MATCH_MULTIPLAS_ESCOLAS,
+    MATCH_TEXTO_COMPLEMENTAR,
+    ORDEM_COLUMN,
+    SEM_CORRESP_CNPJ,
+    SEM_CORRESP_TEXTO,
+    SEM_CNPJ_DMS,
+    CNPJ_INVALIDO_DMS,
+    deterministic_merge_by_cnpj,
+    merge_status_qualifies_textual_complement,
+    stitch_complementary_textual_into_base,
 )
 from services.inferred_mapping import propose_dms_mapping, propose_escola_mapping, propose_matricula_mapping
 from services.municipality_filter import filter_escola_by_municipality, restrict_matricula_to_entidades
@@ -475,8 +489,8 @@ def run_etapa2_mapping(
         }
         if ui_simples:
             st.success(
-                "**Tudo certo.** Pré-processámos os CNPJs em memória — na Etapa 3 pode cruzar também por texto "
-                "se desejar."
+                "**Etapa 2 OK.** CNPJ guardado em ``__cnpj_norm_*`` — na Etapa 3 o **merge vai primeiro por esse "
+                "número (14 dígitos)** e o texto (RapidFuzz) aparece apenas se a linha não tiver CNPJ DMS válido."
             )
         else:
             sample = dms_work[[dms_cnpj, "__cnpj_norm_dms"]].head(8)
@@ -490,8 +504,8 @@ def run_etapa2_mapping(
             st.info("Escolha o **CNPJ** na base DMS e no Censo — é o único par obrigatório para continuar.")
         else:
             st.info(
-                "Seleccione o par **CNPJ** nas duas bases para criar as colunas internas `__cnpj_norm_dms` "
-                "e `__cnpj_norm_censo` antes do matching textual."
+                "Seleccione o par **CNPJ** nas duas bases para normalizar dígitos (``__cnpj_norm_*``) — é o primeiro "
+                "passo obrigatório antes do merge determinístico da Etapa 3."
             )
 
 
@@ -503,153 +517,314 @@ def default_select_index(options: list[str], preferred: str | None) -> int:
     return 0
 
 
-def run_etapa3_textual_merge(
+def run_etapa3_merge_pipeline(
     dms_work: pd.DataFrame,
     censo_work: pd.DataFrame,
     *,
     ux_simples: bool = False,
 ) -> None:
-    """Matching textual + métricas + preview + export ``consolidado.xlsx``."""
+    """Pipeline Etapa 3: merge determinístico por CNPJ + texto opcional apenas sem CNPJ na DMS."""
 
     st.divider()
-    st.header("Etapa 3 — Cruzamento textual (RapidFuzz)")
+    st.header("Etapa 3 — Cruzamento DMS × Censo (**CNPJ primeiro, confiança alta**)")
+    st.markdown(
+        "1. **Chave CNPJ determinística** (`__cnpj_norm_*`): apenas dígitos, **14 dígitos** (`zfill` quando "
+        "há menos de 14 dígitos — ver `utils.cnpj`).\n"
+        "2. **Classificação** por linha DMS antes de texto: correspondência única (`match_cnpj_exato`), "
+        "várias escolas no Censo com o mesmo número (`multiplas_escolas_mesmo_cnpj`), falta na base municipal "
+        "(`sem_correspondencia_cnpj`), campo vazio/inutilizável na DMS ou CNPJ DMS invalidado por regras DV.\n"
+        "3. **RapidFuzz** aparece apenas como passe **complementar** nas linhas em que **não há CNPJ "
+        "utilizável na DMS** — nunca sobrepõe resultados já definidos pela chave fiscal."
+    )
     if ux_simples:
-        st.caption(
-            "**Opcional.** Quando dois CNPJs não coincidem na DMS tentamos aproximar o nome registado pela "
-            "escola usando RapidFuzz (WRatio)."
-        )
+        st.caption("No modo simples o fluxo sugere apenas o merge por CNPJ; o texto fica dentro do expander abaixo.")
     else:
-        st.caption(
-            "Para cada linha da DMS compara-se a razão social **normalizada** com os nomes "
-            "do Censo consolidado (bloqueio por prefixo para bases grandes). "
-            "Scorer: **WRatio**. Saída: **outputs/consolidado.xlsx**."
-        )
+        with st.expander("Arquitetura determinística (para equipa técnica)"):
+            st.markdown(
+                "- **Join lógico** — esquerda sempre a fatia inteira da DMS; lado direito primeira escola encontrada "
+                "por CNPJ no Censo municipal (uso de `lookup_first.groupby(...).head(1)`), com contagem "
+                "`cnpj_censo_candidatos_mesmo_numero` sempre visível quando existem várias hipóteses.\n"
+                "- **Alto grau de confiança (`merge_confianca = alta_conf_cnpj_exato`)** — exclusivo onde existe "
+                "unicidade bilateral da chave 14 dígitos.\n"
+                "- **`merge_metodo_primario`** — inicialmente `cnpj_14_digitos` apenas quando faz sentido usar a "
+                "chave fiscal; ficará vazio no ramo texto-only até opcionalmente preencher com `texto_complementar`."
+            )
 
     cm = st.session_state.get("column_map") or {}
+    col_dms_raw = cm.get("dms_cnpj")
+
     opts_dms = column_options(dms_work)
     opts_censo = column_options(censo_work)
 
-    g1, g2 = st.columns(2)
-    with g1:
-        col_razao = st.selectbox(
-            "NM razão social / texto (DMS)",
-            opts_dms,
-            index=default_select_index(opts_dms, cm.get("dms_razao")),
-            key="etapa3_col_dms_razao",
-        )
-    with g2:
-        col_nome = st.selectbox(
-            "Nome da escola (Censo)",
-            opts_censo,
-            index=default_select_index(opts_censo, cm.get("censo_nome")),
-            key="etapa3_col_censo_nome",
-        )
-
-    cutoff = st.radio(
-        "Pontuação mínima RapidFuzz (0–100)",
-        options=[70, 80, 90],
-        index=1,
-        horizontal=True,
-        key="etapa3_cutoff",
+    sig_det_now = (
+        str(col_dms_raw),
+        str(cm.get("censo_cnpj")),
+        len(dms_work.index),
+        len(censo_work.index),
+        "__cnpj_norm_dms" in dms_work.columns,
+        "__cnpj_norm_censo" in censo_work.columns,
     )
 
-    if col_razao == SELECT_SENTINEL or col_nome == SELECT_SENTINEL:
-        st.warning("Seleccione as duas colunas de texto para executar o matching.")
+    if not col_dms_raw or col_dms_raw == SELECT_SENTINEL:
+        st.error("Finalize a Etapa 2 definindo explicitamente as colunas de CNPJ DMS.")
+        return
+    if "__cnpj_norm_dms" not in dms_work.columns:
+        st.error("Faltam normalizações internas da Etapa 2 — volte atrás para regenerar ``__cnpj_norm_dms``.")
         return
 
-    run_clicked = st.button("Executar matching textual", type="primary", key="btn_etapa3_run")
+    det_clicked = st.button(
+        "Executar merge determinístico (CNPJ 14 dígitos)",
+        type="primary",
+        key="btn_etapa3_merge_cnpj",
+    )
 
-    if run_clicked:
+    if det_clicked:
         prog = st.progress(0)
 
-        def _cb(progress: float) -> None:
+        def _cb_det(progress: float) -> None:
             prog.progress(min(max(progress, 0.0), 1.0))
 
         try:
-            consolidado, summary = run_textual_fuzzy_merge(
+            consolidado_cnpj, summary_cnpj = deterministic_merge_by_cnpj(
                 dms_work,
                 censo_work,
-                col_dms_razao=col_razao,
-                col_censo_nome=col_nome,
-                score_cutoff=float(cutoff),
-                progress_callback=_cb,
+                col_dms_raw_cnpj=str(col_dms_raw),
+                col_dms_norm="__cnpj_norm_dms",
+                col_censo_norm="__cnpj_norm_censo",
+                progress_callback=_cb_det,
             )
         except Exception as exc:  # pylint: disable=broad-except
             prog.empty()
-            st.error("Não foi possível concluir o matching textual.")
-            LOG.exception("Etapa 3 — erro")
+            st.error("Erro durante o merge por CNPJ.")
+            LOG.exception("Etapa 3 — deterministic merge")
             with st.expander("Detalhe técnico"):
                 st.code(str(exc))
             return
 
         prog.empty()
-
-        st.session_state["consolidado_df"] = consolidado
-        st.session_state["consolidado_summary"] = summary
-        st.session_state["etapa3_run_signature"] = (col_razao, col_nome, int(cutoff))
+        st.session_state["consolidado_df"] = consolidado_cnpj
+        st.session_state.pop("consolidado_summary", None)
+        st.session_state["etapa3_cnpj_summary"] = summary_cnpj
+        st.session_state["etapa3_det_sig"] = sig_det_now
+        st.session_state.pop("etapa3_comp_text_summary", None)
+        st.session_state.pop("etapa3_fuzzy_sig", None)
 
         out_path = APP_DIR / "outputs" / "consolidado.xlsx"
         try:
-            consolidado.to_excel(out_path, index=False, engine="openpyxl")
+            consolidado_cnpj.to_excel(out_path, index=False, engine="openpyxl")
             LOG.info(
-                "consolidado.xlsx gravado em %s (%s linhas, %s matches).",
-                out_path,
-                len(consolidado.index),
-                summary.encontrados,
+                "consolidado.xlsx atualizado pelo merge determinístico (linhas=%s)",
+                len(consolidado_cnpj.index),
             )
-            st.success(f"Consolidado gravado em `{out_path}`.")
+            st.success(f"**Merge por CNPJ concluído.** Ficheiro em `{out_path}`.")
         except Exception as exc:  # pylint: disable=broad-except
-            st.warning(f"Gravação em disco falhou (permite mes assim descarregar): {exc}")
-            LOG.exception("Falha ao gravar consolidado.xlsx")
+            st.warning(f"Escrita opcional falhou (pode sempre descarregar): {exc}")
+            LOG.exception("Falha consolidado deterministic write")
 
-    summary_obj = st.session_state.get("consolidado_summary")
-    consolidado = st.session_state.get("consolidado_df")
-    sig_stored = st.session_state.get("etapa3_run_signature")
-    sig_now = (col_razao, col_nome, int(cutoff))
+    sdet = st.session_state.get("etapa3_det_sig")
 
-    if consolidado is None or summary_obj is None:
+    consolidado_raw = st.session_state.get("consolidado_df")
+    summary_det = st.session_state.get("etapa3_cnpj_summary")
+
+    if consolidado_raw is None or summary_det is None:
+        st.info(
+            "Clique **Executar merge determinístico (CNPJ 14 dígitos)** para produzir o consolidado por chave fiscal "
+            "e só depois aparecem métricas, pré-visualização e o texto complementar."
+        )
         return
 
-    if sig_stored != sig_now:
-        st.info(
-            "**Parâmetros alterados** relativamente ao último resultado (colunas ou corte). "
-            "Clique novamente em **Executar matching textual** para atualizar."
+    if isinstance(sdet, tuple) and sdet != sig_det_now:
+        st.warning(
+            "**Colunas CNPJ ou tamanhos das bases mudaram** face ao último merge determinístico. "
+            "Volte a executar **merge por CNPJ (14 dígitos)** para manter dados consistentes."
         )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Linhas DMS", f"{summary_obj.linhas_dms:,}")
-    m2.metric("Matches encontrados", f"{summary_obj.encontrados:,}")
-    m3.metric("Sem correspondência", f"{summary_obj.sem_correspondencia:,}")
-    aderencia = (
-        100.0 * summary_obj.encontrados / summary_obj.linhas_dms
-        if summary_obj.linhas_dms
-        else 0.0
-    )
-    m4.metric("Percentagem match", f"{aderencia:.1f} %")
+    texto_elegivel_n = 0
+    if "match_status_principal" in consolidado_raw.columns:
+        estado_status = consolidado_raw["match_status_principal"]
+        mascara_texto_opt = estado_status.astype(str).apply(
+            lambda s: merge_status_qualifies_textual_complement(s),
+        )
+        mascara_texto_opt = mascara_texto_opt.fillna(False)
+        texto_elegivel_n = int(mascara_texto_opt.sum())
 
-    st.caption(
-        f"Censo com **{summary_obj.linhas_censo:,}** registos · tempo **{summary_obj.tempo_segundos:.2f} s** · "
-        f"corte **≥ {summary_obj.score_min_usado:.0f}**."
+    with st.expander(
+        "**Texto opcional (RapidFuzz)** — apenas linhas sem CNPJ utilizável na DMS",
+        expanded=not ux_simples,
+    ):
+        st.caption(
+            "**Complementar.** Todas as outras categorias ficam definidas apenas pela **chave fiscal CNPJ** "
+            f"(elimina falsos positivos texto). `{texto_elegivel_n}` linha(s) atualmente elegíveis."
+        )
+
+        col_razao = st.selectbox(
+            "Texto institucional na DMS (razão / nome público próximo)",
+            opts_dms,
+            index=default_select_index(opts_dms, cm.get("dms_razao")),
+            key="etapa3_col_dms_razao",
+        )
+        col_nome = st.selectbox(
+            "Denominação pública escola ou entidade (Censo consolidado municipal)",
+            opts_censo,
+            index=default_select_index(opts_censo, cm.get("censo_nome")),
+            key="etapa3_col_censo_nome",
+        )
+        cutoff = st.radio(
+            "Pontuação mínima só no passe texto (WRatio RapidFuzz, 0–100)",
+            options=[70, 80, 90],
+            index=1,
+            horizontal=True,
+            key="etapa3_cutoff",
+        )
+
+        texto_pronto = (
+            col_razao != SELECT_SENTINEL and col_nome != SELECT_SENTINEL and texto_elegivel_n > 0
+        )
+        if not texto_pronto and texto_elegivel_n == 0:
+            st.info("Nesta execução **não há** linhas só com fallback textual.")
+        elif not texto_pronto:
+            st.info("Seleccione as duas colunas de texto válidas antes de executar RapidFuzz.")
+
+        if st.button(
+            "Correr passe textual só nas linhas sem CNPJ válido",
+            disabled=not texto_pronto,
+            key="btn_etapa3_optional_text_run",
+            type="secondary",
+        ):
+            mascara = consolidado_raw["match_status_principal"].astype(str).apply(
+                lambda s: merge_status_qualifies_textual_complement(s),
+            ).fillna(False)
+            if not bool(mascara.any()):
+                st.warning("Nenhuma linha textual elegível após filtros deterministicos mais recentes.")
+            else:
+                subset_dms = dms_work.loc[mascara.to_numpy()].copy().reset_index(drop=True)
+                orden_col = pd.to_numeric(
+                    consolidado_raw.loc[mascara, f"dms__{ORDEM_COLUMN}"],
+                    errors="coerce",
+                )
+                orden_col_series = orden_col.reset_index(drop=True)
+                subset_dms.loc[:, ORDEM_COLUMN] = orden_col_series.to_numpy(dtype=int)
+
+                fz_prog = st.progress(0)
+
+                def _cb_fuzz(progress: float) -> None:
+                    fz_prog.progress(min(max(progress, 0.0), 1.0))
+
+                try:
+                    fz_resultado, _fz_summary = run_textual_fuzzy_merge(
+                        subset_dms,
+                        censo_work,
+                        col_dms_razao=col_razao,
+                        col_censo_nome=col_nome,
+                        score_cutoff=float(cutoff),
+                        progress_callback=_cb_fuzz,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    fz_prog.empty()
+                    st.error("Falha durante RapidFuzz complementar.")
+                    LOG.exception("Etapa 3 — fuzzy opcional")
+                    with st.expander("Detalhe técnico"):
+                        st.code(str(exc))
+                else:
+                    fz_prog.empty()
+                    consolidado_atualizado, texto_sumario = stitch_complementary_textual_into_base(
+                        consolidado_raw,
+                        fz_resultado,
+                        score_cutoff_used=float(cutoff),
+                    )
+                    st.session_state["consolidado_df"] = consolidado_atualizado
+                    st.session_state["etapa3_comp_text_summary"] = texto_sumario
+                    st.session_state["etapa3_fuzzy_sig"] = (col_razao, col_nome, int(cutoff))
+
+                    try:
+                        (APP_DIR / "outputs").mkdir(parents=True, exist_ok=True)
+                        atual_path = APP_DIR / "outputs" / "consolidado.xlsx"
+                        consolidado_atualizado.to_excel(atual_path, index=False, engine="openpyxl")
+                        LOG.info(
+                            "consolidado.xlsx atualizado texto opcional (%s matches textual).",
+                            texto_sumario.matches_texto,
+                        )
+                        st.success(
+                            "**Passe texto aplicado** só onde faltava CNPJ DMS válido · "
+                            f"{texto_sumario.matches_texto} match texto / {texto_sumario.linhas_elegiveis} elegíveis."
+                        )
+                    except Exception as exc:  # pylint: disable=broad-except
+                        st.warning(f"Gravação após texto falhou ({exc}) — pode descarregar manualmente.")
+                        LOG.exception("Falhou escrita texto complement")
+
+    refinado = st.session_state.get("consolidado_df")
+    if not isinstance(refinado, pd.DataFrame):
+        refinado = consolidado_raw
+    summary_actual = summary_det
+
+    diver_agregado_linhas_dms = int(
+        getattr(summary_actual, "multiplas_escolas_mesmo_cnpj", 0)
+        + getattr(summary_actual, "cnpj_dms_invalido", 0)
+        + getattr(summary_actual, "sem_correspondencia_cnpj", 0)
     )
 
+    st.subheader("Métricas — resultado determinístico + divergências resumidas")
+    r1, r2, r3, r4, r5 = st.columns(5)
+    r1.metric("Merge exato alta confiança (CNPJ)", f"{summary_actual.match_cnpj_exato:,}")
+    r2.metric("Linhas sem CNPJ DMS válido (= texto opcional futuro)", f"{texto_elegivel_n:,}")
+    r3.metric("Divergências agregadas (multi + inválidos + falta censo)", f"{diver_agregado_linhas_dms:,}")
+    r4.metric("Dup. várias escolas / mesmo número", f"{summary_actual.multiplas_escolas_mesmo_cnpj:,}")
+    r5.metric("Chaves Censo duplicadas (globalmente)", f"{summary_actual.chaves_com_multiplos_cnpj_no_censo:,}")
+
+    segundo = st.columns(4)
+    segundo[0].metric("Sem correspondência censo (CNPJ DMS válido ausente censo municipal)", f"{summary_actual.sem_correspondencia_cnpj:,}")
+    segundo[1].metric("Linhas DMS vazias (sem dígitos normalizados)", f"{summary_actual.sem_cnpj_dms:,}")
+    segundo[2].metric("CNPJ DMS classificado como inválido (DV/formato)", f"{summary_actual.cnpj_dms_invalido:,}")
+    segundo[3].metric("Tempo passe determinístico (s)", f"{summary_actual.tempo_segundos:.3f}")
+
+    texto_extra = st.session_state.get("etapa3_comp_text_summary")
+    if texto_extra:
+        z1, z2, z3 = st.columns(3)
+        z1.metric("Textual elegível (sem CNPJ válido inicialmente)", f"{texto_extra.linhas_elegiveis:,}")
+        z2.metric("Sucesso texto complement", f"{texto_extra.matches_texto:,}")
+        z3.metric("Sem match textual mesmo após extra", f"{texto_extra.sem_correspondencia:,}")
+        fz_sig = st.session_state.get("etapa3_fuzzy_sig")
+        if fz_sig:
+            fra, fro, fc = fz_sig
+            st.caption(f"Último passe texto rápido: **`{fra}` × `{fro}`** · cutoff WRatio **≥ {fc}**.")
+
+    st.subheader("Pré-visualização + export")
     filt = st.radio(
-        "Pré-visualização consolidado",
-        ["Todos", "Só matches", "Só sem correspondência"],
+        "Segmentar resultado",
+        [
+            "Todos",
+            "Só alta confiança (match_cnpj_exato)",
+            "Divergência — várias escolas / mesmo número",
+            "Sem correspondência censo mesmo com CNPJ DMS válido",
+            "Sem CNPJ normalizável na DMS (+ inválidos — elegível ao texto opcional)",
+            "Só passe textual complementar",
+            "Linhas mesmo sem resultado textual opcional aplicado",
+        ],
         horizontal=True,
         key="etapa3_preview_filter",
     )
-    view = consolidado
-    if filt == "Só matches":
-        view = consolidado.loc[consolidado["match_status"] == "match_textual"].copy()
-    elif filt == "Só sem correspondência":
-        view = consolidado.loc[consolidado["match_status"] == "sem_correspondencia"].copy()
+    view_df = refinado
+    estado = refinado["match_status_principal"].astype(str) if "match_status_principal" in refinado.columns else None
 
-    st.dataframe(view.head(200), use_container_width=True, height=420)
+    if estado is not None and filt == "Só alta confiança (match_cnpj_exato)":
+        view_df = refinado.loc[estado.eq(MATCH_CNPJ_EXATO)].copy()
+    elif estado is not None and filt == "Divergência — várias escolas / mesmo número":
+        view_df = refinado.loc[estado.eq(MATCH_MULTIPLAS_ESCOLAS)].copy()
+    elif estado is not None and filt == "Sem correspondência censo mesmo com CNPJ DMS válido":
+        view_df = refinado.loc[estado.eq(SEM_CORRESP_CNPJ)].copy()
+    elif estado is not None and filt.startswith("Sem CNPJ"):
+        view_df = refinado.loc[estado.isin({SEM_CNPJ_DMS, CNPJ_INVALIDO_DMS})].copy()
+    elif estado is not None and filt == "Só passe textual complementar":
+        view_df = refinado.loc[estado.eq(MATCH_TEXTO_COMPLEMENTAR)].copy()
+    elif estado is not None and filt.startswith("Linhas mesmo sem resultado textual"):
+        view_df = refinado.loc[estado.eq(SEM_CORRESP_TEXTO)].copy()
+
+    st.dataframe(view_df.head(200), use_container_width=True, height=420)
 
     buf = io.BytesIO()
-    consolidado.to_excel(buf, index=False, engine="openpyxl")
+    refinado.to_excel(buf, index=False, engine="openpyxl")
     st.download_button(
-        label="Descarregar consolidado.xlsx",
+        label="Descarregar consolidado.xlsx (último merge)",
         data=buf.getvalue(),
         file_name="consolidado.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -700,8 +875,9 @@ def main() -> None:
     with st.sidebar:
         st.header("Ajuda rápida")
         st.markdown(
-            "- Fluxo típico: **carregar Escola (+ Matrícula)** → definir UF/município → consolidar "
-            "→ carregar **DMS** → normalizar **CNPJ** → matching texto.\n"
+            "- Fluxo típico: **carregar Escola (+ Matrícula)** → definir UF/município → consolidar municipal "
+            "→ **DMS** → **Etapa 2 normalizar CNPJ** → **Etapa 3 merge primeiro por CNPJ determinístico** "
+            "(texto apenas sem CNPJ válido na DMS).\n"
             "- Export **consolidado** na Etapa 3.\n"
             "- Logs: `outputs/app.log` · **⋮ → Clear cache** quando trocar ficheiros grandes."
         )
@@ -1001,7 +1177,7 @@ def _maybe_continue_dms_etapas(
     dms_work = st.session_state.get("dms_work")
     censo_work = st.session_state.get("censo_work")
     if isinstance(dms_work, pd.DataFrame) and isinstance(censo_work, pd.DataFrame):
-        run_etapa3_textual_merge(dms_work, censo_work, ux_simples=ui_simples)
+        run_etapa3_merge_pipeline(dms_work, censo_work, ux_simples=ui_simples)
     else:
         if ui_simples:
             st.info("Assim que escolher o **CNPJ** na DMS e no Censo desbloqueia o matching texto.")

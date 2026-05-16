@@ -1,6 +1,6 @@
 # DMS-Educação × Censo Escolar (local)
 
-Aplicação **Streamlit** offline para carregar bases por **tipo** (sem nomes fixos de ficheiro), consolidar **Censo Escola ⊕ Matrícula** em campos lógicos estáveis e cruzar com a **DMS**.
+Aplicação **Streamlit** offline com contexto **municipal**: carrega bases por tipo, recorta Escola (+ Matrícula) ao município quando possível, consolida o Censo em colunas lógicas e cruza com a **DMS** com **prioridade ao CNPJ determinístico** (texto RapidFuzz só onde não há CNPJ válido na DMS).
 
 ## Execução
 
@@ -9,26 +9,40 @@ cd ...\app
 python -m streamlit run app.py
 ```
 
-## Arquitetura (resumo)
+## Fluxo na UI (resumo)
 
-1. **Tipos de base** (`domain/dataset_kind.py`): `DMS_EDUCACAO`, `CENSO_ESCOLA`, `CENSO_MATRICULA` — independentes do ano do INEP.
-2. **Campos lógicos** (`domain/census_logical.py`): papéis semânticos (`CO_ENTIDADE`, `NO_ENTIDADE`, `matriculas`, …) mapeados pelos cabeçalhos reais do CSV/XLSX.
-3. **Carregamento** (`services/table_loader.py`): `@st.cache_data` por `(tipo, bytes, nome)` — o nome só serve à extensão; não há convenção `Tabela_*_AAAA.csv`.
-4. **Consolidação** (`services/census_consolidator.py`): projeção das colunas físicas → nomes lógicos; **merge externo** por `CO_ENTIDADE`; metadados `censo_exercicio`, `censo_fonte_*`.
-5. **Compatibilidade** (`services/ingest_cache.py`): delegação para `table_loader`.
+1. **Uploads** — DMS, Escola INEP/export, Matrícula (opcional).
+2. **Modo simples / avançado** — modo simples esconde mapeamentos INEP até ser inevitável; avançado mostra todas as associações lógicas.
+3. **Etapa 0** — ano de exercício (``censo_exercicio``) + UF + município (filtro antes do merge, por defeito); no avançado pode desativar o recorte territorial.
+4. **Consolidar Censo municipal** — aplicar filtro territorial bruto ⇢ recortar matrícula ao mesmo ``CO_ENTIDADE`` quando possível ⇢ ``consolidate_census_escolar``; gravar metadados `censo_ctx_*` quando há filtro.
+5. **Etapa 2** — normalização **somente dígitos + 14 posições** (`utils.cnpj` → colunas ``__cnpj_norm_*``).
+6. **Etapa 3** — primeiro **merge igualdade estrita de CNPJ** (`services/cnpj_merge.py`); texto (`services/text_fuzzy_merge.py`) apenas para linhas onde a DMS **não** tem CNPJ normalizável/validado segundo `classify_cnpj_cell`, evitando falsos positivos.
 
-Fluxo UI: **Carregar** (3 slots) → **Mapear** → **Consolidar Censo** → **Etapa 2** (CNPJ) → **Etapa 3** (fuzzy texto).
+## Merge determinístico (Etapa 3)
 
-## Pastas relevantes
+| Conceito | Colunas / comportamento |
+|----------|--------------------------|
+| Chave fiscal | Comparar ``__cnpj_norm_dms`` com ``__cnpj_norm_censo``. |
+| `match_status_principal` | `match_cnpj_exato`, `multiplas_escolas_mesmo_cnpj`, `sem_correspondencia_cnpj`, `sem_cnpj_utilizavel_dms`, `cnpj_dms_invalido`, `match_textual_complementar`, `sem_correspondencia_texto`. |
+| Divergências | Várias escolas partilham o mesmo CNPJ municipal, formato inválido ou chave válida só no lado DMS. |
+| Métricas | Contagens específicas + agregação de divergências + (opcional) estatísticas do passe textual restrito. |
+| Alta confiança | `merge_confianca == alta_conf_cnpj_exato` **apenas** nos matches unicidade 1⇄1 pela chave. |
 
-| Caminho | Função |
-|---------|--------|
-| `domain/` | Tipos de conjunto + especificação de campos lógicos |
-| `services/table_loader.py` | Cache + encaminhamento DMS smart vs leitura plana |
-| `services/census_consolidator.py` | Merge Escola⊕Matrícula |
-| `services/text_fuzzy_merge.py` | Etapa 3 RapidFuzz |
-| `utils/` | CSV/XLSX, texto, DMS ingest, CNPJ |
+Saídas típicas: `outputs/consolidado.xlsx`, `outputs/app.log`.
 
-## Exercício (ano)
+## Módulos principais
 
-O campo **“Exercício do Censo”** na barra lateral não altera leitura de ficheiros; apenas grava **`censo_exercicio`** na base consolidada para rastreabilidade (2024, 2025, 2026, …).
+| Ficheiro / pasta | Papel |
+|------------------|--------|
+| `app.py` | Orquestração Streamlit — Etapa 0, modos, Etapas 2–3. |
+| `domain/census_logical.py` | Papéis lógicos Escola/Matrícula (+ UF/município). |
+| `services/inferred_mapping.py` | Propostas automáticas de nomes físicos típicos. |
+| `services/municipality_filter.py` | Filtro antes do merge. |
+| `services/census_consolidator.py` | Junção Escola ⊕ Matrícula lógicas. |
+| `services/cnpj_merge.py` | Merge igualdade de CNPJ + estados + costura texto opcional. |
+| `services/text_fuzzy_merge.py` | RapidFuzz (somente onde é permitido pela Etapa 3). |
+| `utils/cnpj.py` | Extrair dígitos, `zfill` 14, checksum. |
+
+### Exercício (ano)
+
+O ano deixa de ficar apenas na lateral: é pedido na **Etapa 0**, reproduzido em ``censo_exercicio`` após consolidar.
