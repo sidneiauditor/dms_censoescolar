@@ -13,7 +13,9 @@ Arquitetura (UX atual):
   a aplicar ``add_normalized_cnpj_column`` usando o consolidado + resoluções automáticas (ex.: ``CNPJ_base_escola``).
 - **Etapa 3** — merge determinístico por CNPJ; RapidFuzz opcional só sem CNPJ DMS válido.
 - **Etapa 6.1** — indicadores fiscais básicos (ISS, mensalidade, base de cálculo por matrícula) no consolidado — ver :mod:`services.indicators`.
-- **Etapa 6.2** — painel operacional: KPIs, divergências, rankings, filtros e gráficos — ver :mod:`services.dashboard_metrics`.
+- **Etapa 6.2** — modo **técnico**: filtros + rankings + gráficos em :mod:`services.dashboard_metrics` / :mod:`ui.dashboard`;
+  modo **operacional Salvador**: painel só de divergências de matrículas em :mod:`services.enrollment_divergence` /
+  :mod:`ui.operacional_dashboard`.
 """
 
 from __future__ import annotations
@@ -74,6 +76,7 @@ from utils.file_io import FileValidationError
 
 from cif_geo_salvador import ROTULO_SALVADOR_CURTO, construir_geo_context_salvador
 from ui.dashboard import render_dashboard_ranking_fiscal
+from ui.operacional_dashboard import render_operacional_enrollment_dashboard
 from ui import mode as ui_mode
 from ui import upload as ui_upload
 
@@ -1295,7 +1298,7 @@ def _render_operacional_dashboard_download() -> None:
     if not isinstance(df_op, pd.DataFrame):
         st.info("Ainda não há **base integrada** nesta sessão — use **Arquivos e processamento** para carregar e processar.")
         return
-    render_dashboard_ranking_fiscal(df_op, cm_op, lingua_cif_operacional=True)
+    render_operacional_enrollment_dashboard(df_op, cm_op)
     buf = io.BytesIO()
     df_op.to_excel(buf, index=False, engine="openpyxl")
     st.download_button(
@@ -1492,74 +1495,132 @@ def _executar_pipeline_operacional(
 
 
 def _main_operacional_ui() -> None:
+    """Painel Salvador: upload único em lote e pipeline já existente."""
     ui_mode.marcar_preset_salvador_sessao()
     st.session_state.setdefault("ctx_exercise_default", 2025)
     consolidado_ready = isinstance(st.session_state.get("consolidado_df"), pd.DataFrame)
 
     st.title("CIF — DMS × Censo municipal (Salvador)")
     st.caption(
-        "**Salvador · BA · IBGE 2927408.** Carregue DMS‑Educação, Censo Escola e Censo Matrícula — depois "
-        "**Processar dados** gera automaticamente filtro municipal, integração Escola⊕Matrícula, cruzamento com a DMS e indicadores."
+        "**Salvador · BA · IBGE 2927408.** Use **uma única janela** para CSV/XLSX da DMS, do Censo Escola e "
+        "do Censo Matrícula — o programa identifica o papel de cada um pelos cabeçalhos. Depois utilize "
+        "**Processar dados** (ou o modo automático na barra lateral)."
     )
 
-    clicked = False
     if consolidado_ready:
-        tab_panel, tab_files = st.tabs(["Painel fiscal", "Arquivos e processamento"])
-        with tab_panel:
+        tab_dashboard, zona_arquivos = st.tabs(["Painel fiscal", "Arquivos e processamento"])
+        with tab_dashboard:
             _render_operacional_dashboard_download()
-        with tab_files:
-            up_dms, up_escola, up_mat = ui_upload.render_secao_carregar_arquivos(compacto_operacional=True)
-            dms_df, df_escola, df_mat = _coerce_frames_from_uploads(up_dms, up_escola, up_mat)
-            with st.expander("Pré-visualização (amostra)", expanded=False):
-                _render_previews_operacional(dms_df, df_escola, df_mat, up_dms, up_escola, up_mat)
-            clicked = st.button("Processar dados", type="primary", key="cif_btn_processar_operacional")
+        container_carregamentos = zona_arquivos
     else:
-        up_dms, up_escola, up_mat = ui_upload.render_secao_carregar_arquivos(compacto_operacional=True)
-        dms_df, df_escola, df_mat = _coerce_frames_from_uploads(up_dms, up_escola, up_mat)
-        with st.expander("Pré-visualização (amostra)", expanded=False):
-            _render_previews_operacional(dms_df, df_escola, df_mat, up_dms, up_escola, up_mat)
-        clicked = st.button("Processar dados", type="primary", key="cif_btn_processar_operacional")
+        container_carregamentos = st.container()
 
-    nm_dms = up_dms.name if up_dms else ""
-    nm_esc = up_escola.name if up_escola else ""
-    nm_mat = up_mat.name if up_mat else ""
-    ex_ctx = int(st.session_state.get("ctx_exercise_default", 2025))
-    arq_sig_op = (nm_dms, nm_esc, nm_mat, ex_ctx)
+    clicked_run = False
+    up_slot_dms_final = None
+    up_slot_esc_final = None
+    up_slot_mat_final = None
+    df_dmss = df_esc_final = df_matricula_final = None
+    resultado_do_lote = None
 
-    three_ok = dms_df is not None and df_escola is not None and df_mat is not None
-    auto = bool(st.session_state.get(ui_mode.AUTO_PROCESS_KEY, True))
-    last_ok = st.session_state.get("cif_operacional_ultimo_sig_ok")
-    failed_sig = st.session_state.get("cif_operacional_pipeline_falhou_sig")
-    auto_ok = (
-        auto
-        and three_ok
-        and arq_sig_op != last_ok
-        and failed_sig != arq_sig_op
-    )
-    should_run = (clicked and three_ok) or auto_ok
-
-    if clicked and not three_ok:
-        st.warning("No modo operacional são necessários **os três ficheiros**: DMS‑Educação, Censo Escola e Censo Matrícula.")
-
-    if auto and three_ok and not clicked and arq_sig_op != last_ok and failed_sig != arq_sig_op:
-        st.info("**Sugestão:** os três ficheiros parecem prontos — o processamento automático será aplicado.")
-
-    if should_run and three_ok:
-        ok = _executar_pipeline_operacional(
-            dms_df=dms_df,
-            df_escola=df_escola,
-            df_mat=df_mat,
-            exercise_year_ctx=ex_ctx,
-            up_dms=up_dms,
-            up_escola=up_escola,
-            up_mat=up_mat,
+    with container_carregamentos:
+        up_slot_dms_final, up_slot_esc_final, up_slot_mat_final, resultado_do_lote = (
+            ui_upload.render_operacional_batch_upload()
         )
-        if ok:
-            st.session_state["cif_operacional_ultimo_sig_ok"] = arq_sig_op
+        df_dmss, df_esc_final, df_matricula_final = _coerce_frames_from_uploads(
+            up_slot_dms_final,
+            up_slot_esc_final,
+            up_slot_mat_final,
+        )
+
+        with st.expander("Pré-visualização (amostra)", expanded=False):
+            _render_previews_operacional(
+                df_dmss,
+                df_esc_final,
+                df_matricula_final,
+                up_slot_dms_final,
+                up_slot_esc_final,
+                up_slot_mat_final,
+            )
+
+        tripla_sem_ambiguo = resultado_do_lote.triple_ready()
+        leituras_ok_local = df_dmss is not None and df_esc_final is not None and df_matricula_final is not None
+        pode_gravar_na_pipeline = tripla_sem_ambiguo and leituras_ok_local
+
+        if not tripla_sem_ambiguo:
+            st.button(
+                "Processar dados",
+                disabled=True,
+                key="cif_ops_proc_disabled_waiting_triple",
+                help=(
+                    "O lote ainda não tem uma **única DMS‑Educação**, uma **Escola** e uma **Matrícula** bem "
+                    "identificadas (sem empates entre dois ficheiros do mesmo papel)."
+                ),
+            )
+            clicked_run = False
+        else:
+            clicked_run = st.button(
+                "Processar dados",
+                type="primary",
+                disabled=not leituras_ok_local,
+                key="cif_btn_processar_operacional",
+                help=(
+                    None
+                    if leituras_ok_local
+                    else "Classificação do lote concluída mas ao menos uma base falhou ao abrir."
+                ),
+            )
+
+    nm_dms = up_slot_dms_final.name if up_slot_dms_final else ""
+    nm_esc = up_slot_esc_final.name if up_slot_esc_final else ""
+    nm_mat = up_slot_mat_final.name if up_slot_mat_final else ""
+
+    sig_exercicio_interno_sessao_sidebar = int(st.session_state.get("ctx_exercise_default", 2025))
+    arquivo_sig_interno_sessao_OPS = (nm_dms, nm_esc, nm_mat, sig_exercicio_interno_sessao_sidebar)
+
+    marcador_interno_SUCESS_sessao_PIPELINE_OK = st.session_state.get("cif_operacional_ultimo_sig_ok")
+    marcador_interno_sessao_PIPELINE_FALHOU = st.session_state.get("cif_operacional_pipeline_falhou_sig")
+
+    auto_sidebar_sessao_interno_checkbox = bool(st.session_state.get(ui_mode.AUTO_PROCESS_KEY, True))
+    rerun_auto_interno_checkbox_AND_sem_erro_sessao_PIPELINE = (
+        auto_sidebar_sessao_interno_checkbox
+        and pode_gravar_na_pipeline
+        and arquivo_sig_interno_sessao_OPS != marcador_interno_SUCESS_sessao_PIPELINE_OK
+        and arquivo_sig_interno_sessao_OPS != marcador_interno_sessao_PIPELINE_FALHOU
+    )
+
+    clicou_gravar_pipeline_OK = clicked_run and pode_gravar_na_pipeline
+    deve_rodar_encadeamento = clicou_gravar_pipeline_OK or rerun_auto_interno_checkbox_AND_sem_erro_sessao_PIPELINE
+
+    if clicked_run and not resultado_do_lote.triple_ready():
+        st.warning(
+            "Resolva os avisos do **lote** (Etiquetas DMS / Escola / Matrícula ausentes ou em conflito) antes "
+            "de continuar esta etapa operacional Salvador."
+        )
+    elif clicked_run and resultado_do_lote.triple_ready() and not leituras_ok_local:
+        st.warning(
+            "Etiquetas corretas no lote, mas **CSV/XLSX** com erro estrutural em ao menos uma base — confira mensagens sobre o arquivo."
+        )
+
+    if rerun_auto_interno_checkbox_AND_sem_erro_sessao_PIPELINE and not clicou_gravar_pipeline_OK:
+        st.info("**Triagem válida.** O modo automático da barra lateral vai arrancar o encadeamento completo assim que aplicável.")
+
+    if deve_rodar_encadeamento:
+        resultado_ok_pipeline = _executar_pipeline_operacional(
+            dms_df=df_dmss,
+            df_escola=df_esc_final,
+            df_mat=df_matricula_final,
+            exercise_year_ctx=sig_exercicio_interno_sessao_sidebar,
+            up_dms=up_slot_dms_final,
+            up_escola=up_slot_esc_final,
+            up_mat=up_slot_mat_final,
+        )
+        if resultado_ok_pipeline:
+            st.session_state["cif_operacional_ultimo_sig_ok"] = arquivo_sig_interno_sessao_OPS
             st.session_state.pop("cif_operacional_pipeline_falhou_sig", None)
             st.rerun()
         else:
-            st.session_state["cif_operacional_pipeline_falhou_sig"] = arq_sig_op
+            st.session_state["cif_operacional_pipeline_falhou_sig"] = arquivo_sig_interno_sessao_OPS
+
 
 
 def main() -> None:
