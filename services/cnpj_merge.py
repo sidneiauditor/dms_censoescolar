@@ -21,6 +21,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -46,6 +47,55 @@ MERGE_METODO_CNPJ = "cnpj_14_digitos"
 MERGE_METODO_TEXTO = "texto_complementar"
 
 ORDEM_COLUMN = "merge_linha_ordem"
+
+
+def compute_merge_debug_snapshot(
+    dms_df: pd.DataFrame,
+    censo_df: pd.DataFrame,
+    *,
+    col_dms_norm: str = "__cnpj_norm_dms",
+    col_censo_norm: str = "__cnpj_norm_censo",
+) -> dict[str, Any]:
+    """
+    Métricas para diagnóstico antes/durante falhas no merge: formas, CNPJs únicos (14 dígitos),
+    contagem de chaves com mais do que uma linha (duplicidade no mesmo lado).
+    """
+
+    snap: dict[str, Any] = {
+        "dms_shape": tuple(dms_df.shape),
+        "censo_shape": tuple(censo_df.shape),
+        "dms_col_norm_presente": col_dms_norm in dms_df.columns,
+        "censo_col_norm_presente": col_censo_norm in censo_df.columns,
+        "dms_cnpj_unicos_14_digitos": None,
+        "dms_chaves_com_mais_de_uma_linha": None,
+        "censo_cnpj_unicos_nao_vazio": None,
+        "censo_chaves_com_mais_de_uma_linha": None,
+    }
+    if col_dms_norm in dms_df.columns:
+        s = dms_df[col_dms_norm].astype(str).str.strip()
+        ok = s.str.len().eq(14) & s.str.isdigit()
+        keys = s.loc[ok]
+        snap["dms_cnpj_unicos_14_digitos"] = int(keys.nunique())
+        vc = keys.value_counts()
+        snap["dms_chaves_com_mais_de_uma_linha"] = int((vc > 1).sum())
+    if col_censo_norm in censo_df.columns:
+        s = censo_df[col_censo_norm].astype(str).str.strip()
+        nz = s.ne("")
+        keys_c = s.loc[nz]
+        snap["censo_cnpj_unicos_nao_vazio"] = int(keys_c.nunique())
+        vc = keys_c.value_counts()
+        snap["censo_chaves_com_mais_de_uma_linha"] = int((vc > 1).sum())
+    return snap
+
+
+def _log_merge_debug_snapshot(where: str, snap: dict[str, Any]) -> None:
+    LOG.info(
+        "%s — snapshot merge: dms_shape=%s censo_shape=%s %s",
+        where,
+        snap.get("dms_shape"),
+        snap.get("censo_shape"),
+        {k: v for k, v in snap.items() if k not in ("dms_shape", "censo_shape")},
+    )
 
 
 @dataclass(frozen=True)
@@ -80,119 +130,217 @@ def deterministic_merge_by_cnpj(
 ) -> tuple[pd.DataFrame, CNPJDeterministicSummary]:
     t0 = time.perf_counter()
 
-    dm = dms_df.copy().reset_index(drop=True)
-    cen = censo_df.copy().reset_index(drop=True)
-
-    if col_dms_raw_cnpj not in dm.columns:
-        raise ValueError(f"Coluna DMS esperada ausente: {col_dms_raw_cnpj!r}.")
-    if col_dms_norm not in dm.columns:
-        raise ValueError(f"Finalize a Etapa 2 — falta `{col_dms_norm}`.")
-    if col_censo_norm not in cen.columns:
-        raise ValueError(
-            f"Censo de trabalho sem `{col_censo_norm}`. Esta coluna deve ser criada antes do merge "
-            f"determinístico com `utils.cnpj.add_normalized_cnpj_column` sobre a coluna física CNPJ municipal."
+    def _phase_fail(phase: str, exc: BaseException) -> None:
+        LOG.exception(
+            "deterministic_merge_by_cnpj — exceção na fase %r (causa original preservada em __cause__)",
+            phase,
         )
 
-    n_dms = len(dm.index)
-    n_censo = len(cen.index)
-    dm[ORDEM_COLUMN] = np.arange(n_dms, dtype=int)
+    snap0 = compute_merge_debug_snapshot(
+        dms_df, censo_df, col_dms_norm=col_dms_norm, col_censo_norm=col_censo_norm
+    )
+    _log_merge_debug_snapshot("deterministic_merge_by_cnpj [entrada]", snap0)
 
-    norm_series = dm[col_dms_norm].astype(str).str.strip()
-    chave_usavel = norm_series.str.len().eq(14) & norm_series.str.isdigit()
-    lab_bruto = dm[col_dms_raw_cnpj].map(classify_cnpj_cell)
+    try:
+        dm = dms_df.copy().reset_index(drop=True)
+        cen = censo_df.copy().reset_index(drop=True)
+    except Exception as e:
+        _phase_fail("cópia_reset_index", e)
+        raise RuntimeError(
+            "deterministic_merge_by_cnpj falhou na fase: cópia_reset_index (DataFrame.copy / reset_index)"
+        ) from e
+
+    try:
+        if col_dms_raw_cnpj not in dm.columns:
+            raise ValueError(f"Coluna DMS esperada ausente: {col_dms_raw_cnpj!r}.")
+        if col_dms_norm not in dm.columns:
+            raise ValueError(f"Finalize a Etapa 2 — falta `{col_dms_norm}`.")
+        if col_censo_norm not in cen.columns:
+            raise ValueError(
+                f"Censo de trabalho sem `{col_censo_norm}`. Esta coluna deve ser criada antes do merge "
+                f"determinístico com `utils.cnpj.add_normalized_cnpj_column` sobre a coluna física CNPJ municipal."
+            )
+
+        n_dms = len(dm.index)
+        n_censo = len(cen.index)
+        dm[ORDEM_COLUMN] = np.arange(n_dms, dtype=int)
+
+        norm_series = dm[col_dms_norm].astype(str).str.strip()
+        chave_usavel = norm_series.str.len().eq(14) & norm_series.str.isdigit()
+        lab_bruto = dm[col_dms_raw_cnpj].map(classify_cnpj_cell)
+        LOG.info(
+            "deterministic_merge_by_cnpj — após preparação: n_dms=%s n_censo=%s linhas_com_chave_dms_14d=%s",
+            n_dms,
+            n_censo,
+            int(chave_usavel.sum()),
+        )
+    except Exception as e:
+        _phase_fail("validação_preparação_classify", e)
+        raise RuntimeError(
+            "deterministic_merge_by_cnpj falhou na fase: validação_preparação_classify"
+        ) from e
 
     censo_key_counts: dict[str, int] = {}
     chaves_dup_total = 0
     lookup_first = pd.DataFrame(columns=list(cen.columns), dtype=object)
 
-    if col_censo_norm in cen.columns:
-        nz = cen[col_censo_norm].astype(str).str.strip().ne("")
-        cen_k_rows = cen.loc[nz].copy()
-        if not cen_k_rows.empty:
-            gs = cen_k_rows.groupby(col_censo_norm, dropna=False, sort=False)
-            censo_key_counts = gs.size().to_dict()
-            chaves_dup_total = int((gs.size() > 1).sum())
-            lookup_first = gs.head(1).reset_index(drop=True).set_index(col_censo_norm)
+    try:
+        LOG.info("deterministic_merge_by_cnpj — antes filtro censo (chave normalizada não vazia)")
+        if col_censo_norm in cen.columns:
+            nz = cen[col_censo_norm].astype(str).str.strip().ne("")
+            cen_k_rows = cen.loc[nz].copy()
+            LOG.info(
+                "deterministic_merge_by_cnpj — após filtro: linhas_censo_com_chave=%s de %s",
+                len(cen_k_rows.index),
+                len(cen.index),
+            )
+            if not cen_k_rows.empty:
+                LOG.info("deterministic_merge_by_cnpj — antes groupby(%r)", col_censo_norm)
+                gs = cen_k_rows.groupby(col_censo_norm, dropna=False, sort=False)
+                censo_key_counts = gs.size().to_dict()
+                chaves_dup_total = int((gs.size() > 1).sum())
+                LOG.info(
+                    "deterministic_merge_by_cnpj — após groupby: n_chaves_distintas=%s chaves_censo_com_mais_de_uma_linha=%s",
+                    len(censo_key_counts),
+                    chaves_dup_total,
+                )
+                lookup_first = gs.head(1).reset_index(drop=True).set_index(col_censo_norm)
 
-    censo_wide: pd.DataFrame
-    if lookup_first.empty or col_censo_norm not in cen.columns:
-        censo_wide = pd.DataFrame(index=np.arange(n_dms), columns=list(cen.columns))
-        censo_wide = censo_wide.astype(object)
-        censo_wide.loc[:, :] = pd.NA
-    else:
-        censo_wide = lookup_first.reindex(norm_series.fillna("").tolist()).reset_index(drop=True)
-
-    censo_records: list[dict[str, object]] = []
-    for i in range(n_dms):
-        row = censo_wide.iloc[i]
-        censo_records.append({f"censo__{str(col)}": row[col] for col in cen.columns})
-
-    statuses: list[str] = []
-    confidences: list[str] = []
-    match_counts_series: list[float] = []
-    duplicate_label_series: list[object] = []
-
-    for i in range(n_dms):
-        lab = lab_bruto.iat[i]
-        usable = bool(chave_usavel.iat[i])
-        key = norm_series.iat[i]
-
-        if not usable:
-            statuses.append(SEM_CNPJ_DMS if lab == "empty" else CNPJ_INVALIDO_DMS)
-            confidences.append(CONFIANCA_SEM_CHAVE_MERGE)
-            match_counts_series.append(0.0)
-            duplicate_label_series.append(pd.NA)
+        LOG.info("deterministic_merge_by_cnpj — antes alinhamento (lookup/reindex → censo_wide)")
+        censo_wide: pd.DataFrame
+        if lookup_first.empty or col_censo_norm not in cen.columns:
+            censo_wide = pd.DataFrame(index=np.arange(n_dms), columns=list(cen.columns))
+            censo_wide = censo_wide.astype(object)
+            censo_wide.loc[:, :] = pd.NA
         else:
-            mc = censo_key_counts.get(key, 0)
-            match_counts_series.append(float(mc))
-            if mc <= 0:
-                statuses.append(SEM_CORRESP_CNPJ)
+            # lookup_first foi criado com set_index(col_censo_norm): a chave está no índice, não nas colunas.
+            # reindex(...) seguido de reset_index(drop=True) **eliminava** a chave — gerando KeyError ao pedir row[col_censo_norm].
+            aligned = lookup_first.reindex(norm_series.fillna("").tolist())
+            censo_wide = aligned.reset_index()
+            censo_wide = censo_wide.reindex(columns=list(cen.columns))
+    except Exception as e:
+        _phase_fail("filtro_groupby_alinhamento", e)
+        raise RuntimeError(
+            "deterministic_merge_by_cnpj falhou na fase: filtro_groupby_alinhamento (filtro | groupby | reindex)"
+        ) from e
+
+    try:
+        LOG.info(
+            "deterministic_merge_by_cnpj — antes materialização censo_records (linhas DMS=%s)",
+            n_dms,
+        )
+        LOG.info(
+            "deterministic_merge_by_cnpj — materialização: colunas schema cen.columns=%s",
+            list(map(str, cen.columns)),
+        )
+        LOG.info(
+            "deterministic_merge_by_cnpj — materialização: colunas censo_wide.columns=%s",
+            list(map(str, censo_wide.columns)),
+        )
+        if col_censo_norm not in censo_wide.columns:
+            LOG.warning(
+                "deterministic_merge_by_cnpj — após alinhamento ainda falta %r em censo_wide (usará pd.NA nas células).",
+                col_censo_norm,
+            )
+        if n_dms > 0:
+            zrow = censo_wide.iloc[0]
+            LOG.info(
+                "deterministic_merge_by_cnpj — exemplo linha 0 (Series.iloc[0]): row.index=%s",
+                list(map(str, zrow.index)),
+            )
+
+        censo_records: list[dict[str, object]] = []
+        for i in range(n_dms):
+            row = censo_wide.iloc[i]
+            censo_records.append(
+                {f"censo__{str(col)}": row.get(col, pd.NA) for col in cen.columns},
+            )
+    except Exception as e:
+        _phase_fail("materialização_censo_por_linha_dms", e)
+        raise RuntimeError(
+            "deterministic_merge_by_cnpj falhou na fase: materialização_censo_por_linha_dms"
+        ) from e
+
+    try:
+        LOG.info("deterministic_merge_by_cnpj — antes classificação (status por linha DMS, n=%s)", n_dms)
+        statuses: list[str] = []
+        confidences: list[str] = []
+        match_counts_series: list[float] = []
+        duplicate_label_series: list[object] = []
+
+        for i in range(n_dms):
+            lab = lab_bruto.iat[i]
+            usable = bool(chave_usavel.iat[i])
+            key = norm_series.iat[i]
+
+            if not usable:
+                statuses.append(SEM_CNPJ_DMS if lab == "empty" else CNPJ_INVALIDO_DMS)
                 confidences.append(CONFIANCA_SEM_CHAVE_MERGE)
-                duplicate_label_series.append(pd.NA)
-            elif mc == 1:
-                statuses.append(MATCH_CNPJ_EXATO)
-                confidences.append(CONFIANCA_ALTA_CNPJ)
+                match_counts_series.append(0.0)
                 duplicate_label_series.append(pd.NA)
             else:
-                statuses.append(MATCH_MULTIPLAS_ESCOLAS)
-                confidences.append(CONFIANCA_DIVERGENCIA)
-                duplicate_label_series.append(int(mc))
+                mc = censo_key_counts.get(key, 0)
+                match_counts_series.append(float(mc))
+                if mc <= 0:
+                    statuses.append(SEM_CORRESP_CNPJ)
+                    confidences.append(CONFIANCA_SEM_CHAVE_MERGE)
+                    duplicate_label_series.append(pd.NA)
+                elif mc == 1:
+                    statuses.append(MATCH_CNPJ_EXATO)
+                    confidences.append(CONFIANCA_ALTA_CNPJ)
+                    duplicate_label_series.append(pd.NA)
+                else:
+                    statuses.append(MATCH_MULTIPLAS_ESCOLAS)
+                    confidences.append(CONFIANCA_DIVERGENCIA)
+                    duplicate_label_series.append(int(mc))
 
-        if progress_callback is not None:
-            progress_callback((i + 1) / max(n_dms, 1))
+            if progress_callback is not None:
+                progress_callback((i + 1) / max(n_dms, 1))
+    except Exception as e:
+        _phase_fail("classificação_status", e)
+        raise RuntimeError(
+            "deterministic_merge_by_cnpj falhou na fase: classificação_status"
+        ) from e
 
-    base_pref = dm.add_prefix("dms__")
+    try:
+        LOG.info("deterministic_merge_by_cnpj — antes concat (montagem DataFrame final)")
+        base_pref = dm.add_prefix("dms__")
 
-    placeholders = pd.DataFrame(
-        {
-            "similaridade_score": pd.Series([pd.NA] * n_dms),
-            "dms_texto_normalizado": "",
-            "censo_texto_normalizado_match": "",
-            "censo_indice_original": pd.Series([pd.NA] * n_dms, dtype=object),
-        },
-    )
+        placeholders = pd.DataFrame(
+            {
+                "similaridade_score": pd.Series([pd.NA] * n_dms),
+                "dms_texto_normalizado": "",
+                "censo_texto_normalizado_match": "",
+                "censo_indice_original": pd.Series([pd.NA] * n_dms, dtype=object),
+            },
+        )
 
-    merge_metodos: list[str] = []
-    for stv in statuses:
-        if str(stv) in {SEM_CNPJ_DMS, CNPJ_INVALIDO_DMS}:
-            merge_metodos.append("")
-        else:
-            merge_metodos.append(MERGE_METODO_CNPJ)
-    metodo_prim = pd.Series(merge_metodos, index=np.arange(n_dms), dtype=object)
+        merge_metodos: list[str] = []
+        for stv in statuses:
+            if str(stv) in {SEM_CNPJ_DMS, CNPJ_INVALIDO_DMS}:
+                merge_metodos.append("")
+            else:
+                merge_metodos.append(MERGE_METODO_CNPJ)
+        metodo_prim = pd.Series(merge_metodos, index=np.arange(n_dms), dtype=object)
 
-    out = pd.concat(
-        [
-            base_pref.reset_index(drop=True),
-            pd.DataFrame(censo_records),
-            metodo_prim.rename("merge_metodo_primario"),
-            pd.Series(statuses, name="match_status_principal"),
-            pd.Series(confidences, name="merge_confianca"),
-            pd.Series(match_counts_series, name="cnpj_censo_candidatos_mesmo_numero"),
-            pd.Series(duplicate_label_series, name="censo_escolas_duplicate_count_para_chave"),
-            placeholders.reset_index(drop=True),
-        ],
-        axis=1,
-    )
+        out = pd.concat(
+            [
+                base_pref.reset_index(drop=True),
+                pd.DataFrame(censo_records),
+                metodo_prim.rename("merge_metodo_primario"),
+                pd.Series(statuses, name="match_status_principal"),
+                pd.Series(confidences, name="merge_confianca"),
+                pd.Series(match_counts_series, name="cnpj_censo_candidatos_mesmo_numero"),
+                pd.Series(duplicate_label_series, name="censo_escolas_duplicate_count_para_chave"),
+                placeholders.reset_index(drop=True),
+            ],
+            axis=1,
+        )
+    except Exception as e:
+        _phase_fail("concat_montagem_saida", e)
+        raise RuntimeError(
+            "deterministic_merge_by_cnpj falhou na fase: concat_montagem_saida"
+        ) from e
 
     elapsed = time.perf_counter() - t0
 

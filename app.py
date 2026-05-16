@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import logging
+import traceback
 import sys
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,7 @@ from services.cnpj_merge import (
     SEM_CORRESP_TEXTO,
     SEM_CNPJ_DMS,
     CNPJ_INVALIDO_DMS,
+    compute_merge_debug_snapshot,
     deterministic_merge_by_cnpj,
     merge_status_qualifies_textual_complement,
     stitch_complementary_textual_into_base,
@@ -784,6 +786,14 @@ def run_etapa3_merge_pipeline(
         def _cb_det(progress: float) -> None:
             prog.progress(min(max(progress, 0.0), 1.0))
 
+        merge_snap = compute_merge_debug_snapshot(
+            dms_work,
+            censo_work,
+            col_dms_norm="__cnpj_norm_dms",
+            col_censo_norm="__cnpj_norm_censo",
+        )
+        LOG.info("Etapa 3 — snapshot antes do merge determinístico: %s", merge_snap)
+
         try:
             consolidado_cnpj, summary_cnpj = deterministic_merge_by_cnpj(
                 dms_work,
@@ -795,10 +805,37 @@ def run_etapa3_merge_pipeline(
             )
         except Exception as exc:  # pylint: disable=broad-except
             prog.empty()
-            st.error("Erro durante o merge por CNPJ.")
-            LOG.exception("Etapa 3 — deterministic merge")
-            with st.expander("Detalhe técnico"):
-                st.code(str(exc))
+            tb_full = traceback.format_exc()
+            st.error(
+                "**Erro durante o merge determinístico por CNPJ.** "
+                "Use o expander abaixo para o traceback completo e o snapshot das bases."
+            )
+            LOG.exception("Etapa 3 — deterministic merge (traceback completo no campo 'stacktrace_completo')")
+
+            with st.expander("**Debug — exceção e traceback completos**", expanded=True):
+                st.markdown(f"**Tipo da exceção:** `{type(exc).__name__}`")
+                st.markdown(f"**Mensagem:** `{exc}`")
+                cause = getattr(exc, "__cause__", None)
+                if cause is not None:
+                    st.markdown(
+                        f"**Encadeamento (`__cause__`):** `{type(cause).__name__}` — `{cause}`"
+                    )
+                st.markdown("**Stacktrace (`traceback.format_exc()`):**")
+                st.code(tb_full, language="text")
+
+            with st.expander("**Diagnóstico numérico no momento do merge**", expanded=True):
+                c1, c2 = st.columns(2)
+                c1.markdown("**`dms_work`**")
+                c1.metric("shape (linhas × cols)", str(merge_snap.get("dms_shape")))
+                c2.markdown("**`censo_work`**")
+                c2.metric("shape (linhas × cols)", str(merge_snap.get("censo_shape")))
+                st.markdown("**CNPJs únicos (14 dígitos na DMS; não vazio no Censo)** e **chaves com mais do que uma linha** no mesmo lado:")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("DMS — únicos 14d", str(merge_snap.get("dms_cnpj_unicos_14_digitos", "—")))
+                m2.metric("DMS — chaves com duplicidade", str(merge_snap.get("dms_chaves_com_mais_de_uma_linha", "—")))
+                m3.metric("Censo — únicos (chave ≠ '')", str(merge_snap.get("censo_cnpj_unicos_nao_vazio", "—")))
+                m4.metric("Censo — chaves multi-linha", str(merge_snap.get("censo_chaves_com_mais_de_uma_linha", "—")))
+                st.json(merge_snap)
             return
 
         prog.empty()
