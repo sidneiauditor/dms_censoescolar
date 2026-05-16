@@ -1289,10 +1289,8 @@ def _maybe_continue_dms_etapas(
     st.session_state["column_map"] = cm_new
     st.session_state["dms_work"] = dms_work_ready
     st.session_state["censo_work"] = censo_work_ready
-    if cm_new.get("dms_cnpj"):
-        st.session_state["map_dms_cnpj"] = cm_new["dms_cnpj"]
-    if cm_new.get("censo_cnpj"):
-        st.session_state["map_censo_cnpj"] = cm_new["censo_cnpj"]
+    # Não atribuir a `map_dms_cnpj` / `map_censo_cnpj` aqui: são keys de widget da Etapa 2 e o Streamlit
+    # proíbe escrever `session_state[key]` depois de o widget com `key=` ser instanciado neste rerun.
 
     run_etapa3_merge_pipeline(dms_work_ready, censo_work_ready, ux_simples=ui_simples)
 
