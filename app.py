@@ -39,18 +39,6 @@ from services.census_consolidator import (
     consolidate_census_escolar,
     normalize_co_entidade,
 )
-from services.dashboard_metrics import (
-    MatriculaFaixa,
-    build_operational_table,
-    compute_divergence_counts,
-    compute_kpis,
-    compute_rankings,
-    figure_bar_iss_by_status,
-    figure_donut_match_status,
-    figure_scatter_matriculas_iss,
-    filter_operational_dataframe,
-    resolved_paths_for_dashboard,
-)
 from services.cnpj_merge import (
     MATCH_CNPJ_EXATO,
     MATCH_MULTIPLAS_ESCOLAS,
@@ -72,6 +60,7 @@ from services.indicators import (
     add_basic_fiscal_indicators,
 )
 from services.inferred_mapping import (
+    infer_dms_cnpj_column_operacional,
     propose_dms_mapping,
     propose_escola_mapping,
     propose_matricula_mapping,
@@ -82,6 +71,11 @@ from services.table_loader import load_dataset_bundle, spinner_message
 from services.text_fuzzy_merge import run_textual_fuzzy_merge
 from utils.cnpj import add_normalized_cnpj_column, summarize_cnpj_column
 from utils.file_io import FileValidationError
+
+from cif_geo_salvador import ROTULO_SALVADOR_CURTO, construir_geo_context_salvador
+from ui.dashboard import render_dashboard_ranking_fiscal
+from ui import mode as ui_mode
+from ui import upload as ui_upload
 
 APP_DIR = Path(__file__).resolve().parent
 SELECT_SENTINEL = "-- Selecionar coluna --"
@@ -97,6 +91,7 @@ def ensure_normalized_cnpj_workframes(
     column_map: dict[str, Any],
     df_dms: pd.DataFrame,
     df_censo_consolidado: pd.DataFrame,
+    inferencia_operacional_dms: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]] | None:
     """
     Etapa obrigatória antes do merge determinístico: cria ``__cnpj_norm_dms`` e ``__cnpj_norm_censo`` via
@@ -104,31 +99,64 @@ def ensure_normalized_cnpj_workframes(
 
     Também corrige cenários onde o consolidado ganhou nomes tipo ``CNPJ_base_escola`` após Escola⊕Matrícula
     (:func:`~services.inferred_mapping.resolve_census_cnpj_physical_column`).
+
+    ``inferencia_operacional_dms`` (somente fluxo operacional Salvador):
+        se ``True``, tenta primeiro :func:`~services.inferred_mapping.infer_dms_cnpj_column_operacional`;
+        se não bastar, cai para :func:`~services.inferred_mapping.propose_dms_mapping` como no modo técnico.
+        Com ``False`` por defeito, o comportamento é o histórico: só ``column_map`` + ``propose_dms_mapping``.
     """
 
     cm_out: dict[str, Any] = dict(column_map or {})
     d_cols = {str(c) for c in df_dms.columns}
 
+    def _dms_pick_invalid(pick_val: object) -> bool:
+        return (
+            not isinstance(pick_val, str)
+            or pick_val == SELECT_SENTINEL
+            or not str(pick_val).strip()
+            or str(pick_val) not in d_cols
+        )
+
     dms_pick = cm_out.get("dms_cnpj")
-    if (
-        not isinstance(dms_pick, str)
-        or dms_pick == SELECT_SENTINEL
-        or not dms_pick.strip()
-        or dms_pick not in d_cols
-    ):
+
+    if _dms_pick_invalid(dms_pick) and inferencia_operacional_dms:
+        op_hit, metodo_op = infer_dms_cnpj_column_operacional([str(c) for c in df_dms.columns])
+        if op_hit and op_hit in d_cols:
+            dms_pick = op_hit
+            cm_out["dms_cnpj"] = op_hit
+            LOG.info(
+                "DMS CNPJ inferido (modo operacional) — coluna=%r método=%s",
+                op_hit,
+                metodo_op,
+            )
+
+    if _dms_pick_invalid(dms_pick):
         inferred_d = propose_dms_mapping([str(c) for c in df_dms.columns]).get("CNPJ")
         if inferred_d and inferred_d in df_dms.columns:
             dms_pick = inferred_d
             cm_out["dms_cnpj"] = inferred_d
+            metodo_fallback = (
+                "fallback_propose_dms_mapping(DMS_ALIASES[CNPJ])_apos_inferencia_operacional"
+                if inferencia_operacional_dms
+                else "propose_dms_mapping(DMS_ALIASES[CNPJ])"
+            )
             LOG.info(
-                "CNPJ DMS inferido automaticamente para normalização Etapa 3: `%s`.",
+                "DMS CNPJ inferido — coluna=%r método=%s",
                 inferred_d,
+                metodo_fallback,
             )
         else:
-            st.error(
-                "**DMS**: não conseguimos localizar uma coluna de CNPJ física válida neste arquivo. Na Etapa 2 "
-                "escolha manualmente a coluna do contribuinte."
-            )
+            if inferencia_operacional_dms:
+                st.error(
+                    "**DMS**: não foi possível identificar uma coluna de **CNPJ** reconhecível neste extrato "
+                    "(após a ordem operacional típica e a heurística genérica). Abra **Técnico / diagnóstico completo** "
+                    "e associe manualmente na **Etapa 2**, ou verifique nomes esperados como `NUCNPJ`, `NU_CNPJ`, `CNPJ`."
+                )
+            else:
+                st.error(
+                    "**DMS**: não conseguimos localizar uma coluna de CNPJ física válida neste arquivo. Na Etapa 2 "
+                    "escolha manualmente a coluna do contribuinte."
+                )
             return None
 
     censo_pick = cm_out.get("censo_cnpj")
@@ -724,151 +752,6 @@ def render_etapa3_premerge_diagnostics(
             )
 
 
-def render_etapa6_2_fiscal_dashboard(df: pd.DataFrame, cm: dict[str, Any]) -> None:
-    """Painel 6.2: filtros, KPIs, divergências, rankings, gráficos e tabela operacional (delega agregações ao módulo)."""
-
-    FAIXA_LABELS: dict[str, MatriculaFaixa] = {
-        "Todas": "todas",
-        "0 matrículas": "zero",
-        "1–50 matrículas": "1_50",
-        "51–200 matrículas": "51_200",
-        "≥201 matrículas": "201_mais",
-    }
-
-    st.divider()
-    st.header("Etapa 6.2 — Painel de divergências e ranking fiscal")
-    st.caption(
-        "Base: **consolidado atual** (Etapa 3 + 6.1). Filtros e agregações são recalculados a cada rerun "
-        "via `services.dashboard_metrics` — sem misturar UI com regras de negócio dos indicadores linha a linha."
-    )
-
-    cms = dict(cm or {})
-    paths = resolved_paths_for_dashboard(df, cms)
-
-    with st.expander("Arquitetura do painel 6.2 (equipa técnica)", expanded=False):
-        st.markdown(
-            "- **dashboard_metrics** resolve colunas `dms__` / `censo__` por aliases (ISS, matrículas, dependência, razão, "
-            "CNPJ) e aplica **filtros declarativos** (`filter_operational_dataframe`).\n"
-            "- **KPIs** (`compute_kpis`): somatórios sobre o subconjunto filtrado — nota: `total_matriculas` soma o "
-            "denominador linha a linha.\n"
-            "- **Divergências** (`compute_divergence_counts`): cruzamento de `match_status_principal` com análise "
-            "de linhas **sem matrícula** não vazia/positiva.\n"
-            "- **Rankings** (`compute_rankings`): tops por linha sobre ISS bruto, `iss_por_matricula` e "
-            "`mensalidade_por_aluno` quando existirem.\n"
-            "- **Gráficos Plotly** — donut por status, barras ISS × status, dispersão matrículas × ISS.\n"
-            "- **Tabela operacional** (`build_operational_table`) — visão compacta para uso fiscal imediato.\n"
-            "- **indicators.py** continua apenas a materializar ratios no `DataFrame` (Etapa 6.1)."
-        )
-
-    status_col = "match_status_principal"
-    status_vals: list[str] = []
-    if status_col in df.columns:
-        status_vals = sorted(df[status_col].dropna().astype(str).unique().tolist())
-
-    c_f1, c_f2, c_f3 = st.columns(3)
-    with c_f1:
-        sel_stat = st.multiselect(
-            "Filtro: `match_status_principal`",
-            options=status_vals,
-            default=status_vals if status_vals else [],
-            disabled=not bool(status_vals),
-            key="dash_filter_match_status",
-            help="Remova valores para cortar categorias — lista vazio = não restringir por status.",
-        )
-    dep_col = paths.get("dependencia")
-    dep_vals: list[str] = []
-    if dep_col and dep_col in df.columns:
-        dep_vals = sorted({str(x).strip() for x in df[dep_col].dropna().unique().tolist() if str(x).strip()})
-    with c_f2:
-        sel_dep = st.multiselect(
-            "Filtro: dependência administrativa (coluna Censo)",
-            options=dep_vals,
-            default=[],
-            key="dash_filter_dependencia",
-            disabled=not dep_vals,
-            help="Seleccione um ou mais códigos/etiquetas. Vazio = não filtrar.",
-        )
-    with c_f3:
-        faixa_lbl = st.radio(
-            "Filtro: faixa de matrícula (coluna do Censo)",
-            options=list(FAIXA_LABELS.keys()),
-            key="dash_filter_faixa_matricula",
-        )
-
-    faixa: MatriculaFaixa = FAIXA_LABELS[faixa_lbl]
-    dash_df = filter_operational_dataframe(
-        df,
-        column_map=cms,
-        match_status=sel_stat if sel_stat else None,
-        dependencia=sel_dep if sel_dep else None,
-        matricula_faixa=faixa,
-    )
-
-    kpis = compute_kpis(dash_df, cms)
-    divs = compute_divergence_counts(dash_df, cms)
-    rankings = compute_rankings(dash_df, cms, top_n=12)
-
-    g0, g1, g2, g3, g4, g5 = st.columns(6)
-    g0.metric("Linhas filtradas", f"{kpis.linhas_filtradas:,}")
-    g1.metric("Total ISS", f"{kpis.total_iss:,.2f}")
-    g2.metric("Σ matrículas (linhas)", f"{kpis.total_matriculas:,.0f}")
-    g3.metric("Escolas (CNPJ DMS distintos)", f"{kpis.total_escolas:,}")
-    g4.metric("Match exato (linhas)", f"{kpis.total_match_exato:,}")
-    g5.metric("Sem correspondência (linhas)", f"{kpis.total_sem_correspondencia:,}")
-
-    st.subheader("Painel de divergências (subconjunto filtrado)")
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Sem correspondência CNPJ", f"{divs.sem_correspondencia:,}")
-    d2.metric("Múltiplas escolas / CNPJ", f"{divs.multiplas_escolas:,}")
-    d3.metric("Sem matrícula ou ≤0", f"{divs.sem_matricula:,}")
-    d4.metric("CNPJ DMS inválido", f"{divs.cnpj_invalido:,}")
-
-    st.subheader("Rankings fiscais (top 12 linhas)")
-    r1, r2, r3 = st.columns(3)
-    with r1:
-        st.markdown("**Top ISS (valor bruto)**")
-        st.dataframe(rankings.top_iss, use_container_width=True, height=260, hide_index=True)
-    with r2:
-        st.markdown("**Top ISS / matrícula**")
-        st.dataframe(rankings.top_iss_por_matricula, use_container_width=True, height=260, hide_index=True)
-    with r3:
-        st.markdown("**Top mensalidade / aluno**")
-        st.dataframe(rankings.top_mensalidade_por_aluno, use_container_width=True, height=260, hide_index=True)
-
-    st.subheader("Gráficos")
-    gc1, gc2 = st.columns(2)
-    with gc1:
-        st.plotly_chart(
-            figure_donut_match_status(dash_df),
-            use_container_width=True,
-            key="dash_plotly_donut_match",
-        )
-    with gc2:
-        st.plotly_chart(
-            figure_bar_iss_by_status(dash_df, cms),
-            use_container_width=True,
-            key="dash_plotly_bar_iss_status",
-        )
-    st.plotly_chart(
-        figure_scatter_matriculas_iss(dash_df, cms),
-        use_container_width=True,
-        key="dash_plotly_scatter_mat_iss",
-    )
-
-    st.subheader("Tabela operacional (até 500 linhas filtradas)")
-    st.dataframe(
-        build_operational_table(dash_df, cms, max_rows=500),
-        use_container_width=True,
-        height=420,
-        hide_index=True,
-    )
-
-    if not paths.get("iss"):
-        st.warning("Coluna de **ISS** não detectada no consolidado (`dms__…`) — alguns gráficos e KPIs ficam vazios.")
-    if not paths.get("matriculas"):
-        st.warning("Coluna de **matrículas** não detectada (`censo__…`) — faixas e dispersão podem falhar.")
-
-
 def run_etapa3_merge_pipeline(
     dms_work: pd.DataFrame,
     censo_work: pd.DataFrame,
@@ -878,7 +761,10 @@ def run_etapa3_merge_pipeline(
     """Pipeline Etapa 3: merge determinístico por CNPJ + texto opcional apenas sem CNPJ na DMS."""
 
     st.divider()
-    st.header("Etapa 3 — Cruzamento DMS × Censo (**CNPJ primeiro, confiança alta**)")
+    if ux_simples:
+        st.header("Cruzamento de dados — DMS × Censo (chave fiscal CNPJ)")
+    else:
+        st.header("Etapa 3 — Cruzamento DMS × Censo (**CNPJ primeiro, confiança alta**)")
     st.markdown(
         "1. **Chave CNPJ determinística** (`__cnpj_norm_*`): apenas dígitos, **14 dígitos** (`zfill` quando "
         "há menos de 14 dígitos — ver `utils.cnpj`).\n"
@@ -938,8 +824,13 @@ def run_etapa3_merge_pipeline(
 
     det_clicked = False
     if not merge_bloqueado:
+        merge_btn_label = (
+            "Cruzar dados fiscais (CNPJ 14 dígitos)"
+            if ux_simples
+            else "Executar merge determinístico (CNPJ 14 dígitos)"
+        )
         det_clicked = st.button(
-            "Executar merge determinístico (CNPJ 14 dígitos)",
+            merge_btn_label,
             type="primary",
             key="btn_etapa3_merge_cnpj",
         )
@@ -1038,10 +929,12 @@ def run_etapa3_merge_pipeline(
     summary_det = st.session_state.get("etapa3_cnpj_summary")
 
     if consolidado_raw is None or summary_det is None:
-        st.info(
-            "Clique **Executar merge determinístico (CNPJ 14 dígitos)** para produzir o consolidado por chave fiscal "
-            "e só depois aparecem métricas, pré-visualização e o texto complementar."
+        lbl = (
+            "Cruzar dados fiscais (CNPJ 14 dígitos)"
+            if ux_simples
+            else "Executar merge determinístico (CNPJ 14 dígitos)"
         )
+        st.info(f"Clique **{lbl}** para gerar a **base integrada** por chave fiscal e só depois surgem métricas, pré-visualização e texto complementar.")
         return
 
     if isinstance(sdet, tuple) and sdet != sig_det_now:
@@ -1266,7 +1159,7 @@ def run_etapa3_merge_pipeline(
             "Indicadores não materializados nesta sessão — verifique colunas fiscais na DMS e matrículas no Censo."
         )
 
-    render_etapa6_2_fiscal_dashboard(refinado, cm)
+    render_dashboard_ranking_fiscal(refinado, cm, lingua_cif_operacional=False)
 
     texto_extra = st.session_state.get("etapa3_comp_text_summary")
     if texto_extra:
@@ -1349,69 +1242,385 @@ def _load_bundle(kind: DatasetKind, uploaded: Any, label_erro: str) -> dict[str,
     return None
 
 
+def _coerce_frames_from_uploads(
+    up_dms: Any,
+    up_escola: Any,
+    up_mat: Any,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+    dms_bundle = _load_bundle(DatasetKind.DMS_EDUCACAO, up_dms, "DMS-Educação")
+    escola_bundle = _load_bundle(DatasetKind.CENSO_ESCOLA, up_escola, "Censo Escola")
+    mat_bundle = _load_bundle(DatasetKind.CENSO_MATRICULA, up_mat, "Censo Matrícula")
+    dms_df = dms_bundle["dataframe"] if dms_bundle else None
+    df_escola = escola_bundle["dataframe"] if escola_bundle else None
+    df_mat = mat_bundle["dataframe"] if mat_bundle else None
+    return dms_df, df_escola, df_mat
+
+
+def _render_previews_operacional(
+    dms_df: pd.DataFrame | None,
+    df_escola: pd.DataFrame | None,
+    df_mat: pd.DataFrame | None,
+    up_dms: Any,
+    up_escola: Any,
+    up_mat: Any,
+) -> None:
+    preview_h = 220
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**DMS-Educação**")
+        if dms_df is None or up_dms is None:
+            st.caption("Aguardando ficheiro válido.")
+        else:
+            st.caption(f"`{up_dms.name}` · {len(dms_df):,} linhas")
+            st.dataframe(dms_df.head(8), use_container_width=True, height=preview_h)
+    with c2:
+        st.markdown("**Censo Escola**")
+        if df_escola is None or up_escola is None:
+            st.caption("Aguardando ficheiro válido.")
+        else:
+            st.caption(f"`{up_escola.name}` · {len(df_escola):,} linhas")
+            st.dataframe(df_escola.head(8), use_container_width=True, height=preview_h)
+    with c3:
+        st.markdown("**Censo Matrícula**")
+        if df_mat is None or up_mat is None:
+            st.caption("Aguardando ficheiro válido.")
+        else:
+            st.caption(f"`{up_mat.name}` · {len(df_mat):,} linhas")
+            st.dataframe(df_mat.head(8), use_container_width=True, height=preview_h)
+
+
+def _render_operacional_dashboard_download() -> None:
+    df_op = st.session_state.get("consolidado_df")
+    cm_op = dict(st.session_state.get("column_map") or {})
+    if not isinstance(df_op, pd.DataFrame):
+        st.info("Ainda não há **base integrada** nesta sessão — use **Arquivos e processamento** para carregar e processar.")
+        return
+    render_dashboard_ranking_fiscal(df_op, cm_op, lingua_cif_operacional=True)
+    buf = io.BytesIO()
+    df_op.to_excel(buf, index=False, engine="openpyxl")
+    st.download_button(
+        label="Descarregar base integrada (.xlsx)",
+        data=buf.getvalue(),
+        file_name="base_integrada.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_base_integrada_operacional",
+    )
+
+
+def _executar_pipeline_operacional(
+    *,
+    dms_df: pd.DataFrame,
+    df_escola: pd.DataFrame,
+    df_mat: pd.DataFrame,
+    exercise_year_ctx: int,
+    up_dms: Any,
+    up_escola: Any,
+    up_mat: Any,
+) -> bool:
+    cols_esc = list(map(str, df_escola.columns))
+    map_e = resolve_escola_mapping(cols_esc, ui_simples=True)
+    map_m = resolve_matricula_mapping(list(map(str, df_mat.columns)), ui_simples=True)
+
+    geo_ctx = construir_geo_context_salvador(df_escola, map_e, int(exercise_year_ctx))
+    if geo_ctx.get("filtro_impossivel_geo"):
+        st.error(
+            "Não foi possível aplicar o recorte automático para **Salvador (BA, IBGE 2927408)** nesta base Escola. "
+            "Confirme que o extracto contempla esse município ou utilize o modo **Técnico / diagnóstico completo**."
+        )
+        return False
+    geo_ctx["mun_label"] = ROTULO_SALVADOR_CURTO
+
+    df_esc_eff = df_escola.copy()
+    df_mat_eff = df_mat.copy()
+    filt_stats: dict[str, str | int] = {}
+    if geo_ctx.get("filtro_ativo") and geo_ctx.get("uf") and geo_ctx.get("mun_code"):
+        df_esc_eff, filt_stats = filter_escola_by_municipality(
+            df_esc_eff,
+            map_e,
+            uf_escolha=str(geo_ctx["uf"]),
+            municipio_codigo=str(geo_ctx["mun_code"]),
+        )
+        motivo_txt = filt_stats.get("motivo", "")
+        if motivo_txt:
+            st.warning(f"Recorte municipal: {motivo_txt}")
+        else:
+            antes = filt_stats.get("antes", "")
+            depois = filt_stats.get("depois", "")
+            st.info(f"Escolas antes ▸ depois do recorte Salvador: **`{antes:,}` ▸ `{depois:,}`**.")
+
+    phys_co_esc = map_e.get("CO_ENTIDADE")
+    if phys_co_esc and phys_co_esc in df_esc_eff.columns:
+        subset_co = normalize_co_entidade(df_esc_eff[phys_co_esc])
+        entidades = set(subset_co.tolist())
+        entidades.discard("")
+        phys_co_mat = map_m.get("CO_ENTIDADE")
+        if (
+            phys_co_mat
+            and isinstance(phys_co_mat, str)
+            and phys_co_mat in df_mat_eff.columns
+            and entidades
+        ):
+            df_mat_eff_, mat_trim = restrict_matricula_to_entidades(df_mat_eff, phys_co_mat, entidades)
+            df_mat_eff = df_mat_eff_
+            st.success(
+                f"Matrículas recortadas ao mesmo conjunto de escolas (**{phys_co_mat}**): "
+                f"{mat_trim['antes_mat']:,} → {mat_trim['depois_mat']:,} linhas."
+            )
+
+    fn_esc = up_escola.name if up_escola else ""
+    fn_mat = up_mat.name if up_mat else ""
+    try:
+        merged_out = consolidate_census_escolar(
+            df_esc_eff,
+            df_mat_eff,
+            map_e,
+            map_m,
+            int(exercise_year_ctx),
+            source_escola_label=fn_esc,
+            source_matricula_label=fn_mat or "",
+        )
+    except CensusMergeError as exc:
+        st.error(str(exc))
+        LOG.warning("Consolidação operacional recusada: %s", exc)
+        return False
+    except Exception as exc:  # pylint: disable=broad-except
+        st.error("Erro inesperado ao integrar Escola ⊕ Matrícula.")
+        LOG.exception("merge censo operacional")
+        with st.expander("Detalhe técnico", expanded=False):
+            st.code(str(exc))
+        return False
+
+    merged_final = append_censo_context_columns(merged_out, geo_ctx)
+    st.session_state["censo_consolidado_df"] = merged_final
+    stale_sig_anchor = tuple(
+        sorted(
+            {
+                ("uf_pick", geo_ctx.get("uf")),
+                ("mun_pick", geo_ctx.get("mun_code")),
+                ("filtro_geo", geo_ctx.get("filtro_ativo")),
+                ("skip_geo_flag", geo_ctx.get("skip_geo")),
+            }
+        )
+    )
+    st.session_state["censo_consolidado_signature"] = (
+        fn_esc,
+        fn_mat or "",
+        int(exercise_year_ctx),
+        True,
+        tuple(sorted(map_e.items())),
+        tuple(sorted(map_m.items())),
+        stale_sig_anchor,
+    )
+
+    cm_live = dict(st.session_state.get("column_map") or {})
+    rebuilt = ensure_normalized_cnpj_workframes(
+        column_map=cm_live,
+        df_dms=dms_df,
+        df_censo_consolidado=merged_final,
+        inferencia_operacional_dms=True,
+    )
+    if rebuilt is None:
+        return False
+    dms_work_ready, censo_work_ready, cm_new = rebuilt
+    st.session_state["column_map"] = cm_new
+    st.session_state["dms_work"] = dms_work_ready
+    st.session_state["censo_work"] = censo_work_ready
+
+    col_dms_raw = cm_new.get("dms_cnpj")
+    if (
+        not col_dms_raw
+        or col_dms_raw == SELECT_SENTINEL
+        or "__cnpj_norm_dms" not in dms_work_ready.columns
+        or "__cnpj_norm_censo" not in censo_work_ready.columns
+    ):
+        st.error("Não foi possível preparar o cruzamento por **CNPJ**. Utilize o modo técnico para corrigir mapeamentos.")
+        return False
+
+    sig_det_now = (
+        str(col_dms_raw),
+        str(cm_new.get("censo_cnpj")),
+        len(dms_work_ready.index),
+        len(censo_work_ready.index),
+        True,
+        True,
+    )
+
+    try:
+        with st.spinner("A integrar bases e cruzar dados fiscais (CNPJ)…"):
+            consolidado_cnpj, summary_cnpj = deterministic_merge_by_cnpj(
+                dms_work_ready,
+                censo_work_ready,
+                col_dms_raw_cnpj=str(col_dms_raw),
+                col_dms_norm="__cnpj_norm_dms",
+                col_censo_norm="__cnpj_norm_censo",
+                progress_callback=None,
+            )
+    except Exception as exc:  # pylint: disable=broad-except
+        st.error(
+            "Falha ao cruzar dados fiscais. Abra o modo **Técnico / diagnóstico completo** para ver o relatório pré-merge "
+            "e o debug detalhado."
+        )
+        LOG.exception("operacional deterministic merge")
+        with st.expander("Detalhe técnico", expanded=False):
+            st.code(str(exc))
+        return False
+
+    consolidado_cnpj, _report61 = add_basic_fiscal_indicators(consolidado_cnpj, dict(cm_new))
+    st.session_state["consolidado_df"] = consolidado_cnpj
+    st.session_state.pop("consolidado_summary", None)
+    st.session_state["etapa3_cnpj_summary"] = summary_cnpj
+    st.session_state["etapa3_det_sig"] = sig_det_now
+    st.session_state.pop("etapa3_comp_text_summary", None)
+    st.session_state.pop("etapa3_fuzzy_sig", None)
+
+    out_path = APP_DIR / "outputs" / "consolidado.xlsx"
+    try:
+        (APP_DIR / "outputs").mkdir(parents=True, exist_ok=True)
+        consolidado_cnpj.to_excel(out_path, index=False, engine="openpyxl")
+        LOG.info(
+            "consolidado.xlsx atualizado — pipeline operacional (linhas=%s)",
+            len(consolidado_cnpj.index),
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        st.warning(f"Não foi possível gravar o ficheiro local em disco: {exc}")
+        LOG.exception("Falha escrita consolidado operacional")
+
+    st.success(
+        "**Base integrada** pronta — painel fiscal actualizado."
+    )
+    return True
+
+
+def _main_operacional_ui() -> None:
+    ui_mode.marcar_preset_salvador_sessao()
+    st.session_state.setdefault("ctx_exercise_default", 2025)
+    consolidado_ready = isinstance(st.session_state.get("consolidado_df"), pd.DataFrame)
+
+    st.title("CIF — DMS × Censo municipal (Salvador)")
+    st.caption(
+        "**Salvador · BA · IBGE 2927408.** Carregue DMS‑Educação, Censo Escola e Censo Matrícula — depois "
+        "**Processar dados** gera automaticamente filtro municipal, integração Escola⊕Matrícula, cruzamento com a DMS e indicadores."
+    )
+
+    clicked = False
+    if consolidado_ready:
+        tab_panel, tab_files = st.tabs(["Painel fiscal", "Arquivos e processamento"])
+        with tab_panel:
+            _render_operacional_dashboard_download()
+        with tab_files:
+            up_dms, up_escola, up_mat = ui_upload.render_secao_carregar_arquivos(compacto_operacional=True)
+            dms_df, df_escola, df_mat = _coerce_frames_from_uploads(up_dms, up_escola, up_mat)
+            with st.expander("Pré-visualização (amostra)", expanded=False):
+                _render_previews_operacional(dms_df, df_escola, df_mat, up_dms, up_escola, up_mat)
+            clicked = st.button("Processar dados", type="primary", key="cif_btn_processar_operacional")
+    else:
+        up_dms, up_escola, up_mat = ui_upload.render_secao_carregar_arquivos(compacto_operacional=True)
+        dms_df, df_escola, df_mat = _coerce_frames_from_uploads(up_dms, up_escola, up_mat)
+        with st.expander("Pré-visualização (amostra)", expanded=False):
+            _render_previews_operacional(dms_df, df_escola, df_mat, up_dms, up_escola, up_mat)
+        clicked = st.button("Processar dados", type="primary", key="cif_btn_processar_operacional")
+
+    nm_dms = up_dms.name if up_dms else ""
+    nm_esc = up_escola.name if up_escola else ""
+    nm_mat = up_mat.name if up_mat else ""
+    ex_ctx = int(st.session_state.get("ctx_exercise_default", 2025))
+    arq_sig_op = (nm_dms, nm_esc, nm_mat, ex_ctx)
+
+    three_ok = dms_df is not None and df_escola is not None and df_mat is not None
+    auto = bool(st.session_state.get(ui_mode.AUTO_PROCESS_KEY, True))
+    last_ok = st.session_state.get("cif_operacional_ultimo_sig_ok")
+    failed_sig = st.session_state.get("cif_operacional_pipeline_falhou_sig")
+    auto_ok = (
+        auto
+        and three_ok
+        and arq_sig_op != last_ok
+        and failed_sig != arq_sig_op
+    )
+    should_run = (clicked and three_ok) or auto_ok
+
+    if clicked and not three_ok:
+        st.warning("No modo operacional são necessários **os três ficheiros**: DMS‑Educação, Censo Escola e Censo Matrícula.")
+
+    if auto and three_ok and not clicked and arq_sig_op != last_ok and failed_sig != arq_sig_op:
+        st.info("**Sugestão:** os três ficheiros parecem prontos — o processamento automático será aplicado.")
+
+    if should_run and three_ok:
+        ok = _executar_pipeline_operacional(
+            dms_df=dms_df,
+            df_escola=df_escola,
+            df_mat=df_mat,
+            exercise_year_ctx=ex_ctx,
+            up_dms=up_dms,
+            up_escola=up_escola,
+            up_mat=up_mat,
+        )
+        if ok:
+            st.session_state["cif_operacional_ultimo_sig_ok"] = arq_sig_op
+            st.session_state.pop("cif_operacional_pipeline_falhou_sig", None)
+            st.rerun()
+        else:
+            st.session_state["cif_operacional_pipeline_falhou_sig"] = arq_sig_op
+
+
 def main() -> None:
     configure_logging()
     st.set_page_config(
-        page_title="DMS × Censo Escolar",
+        page_title="DMS × Censo Escolar · CIF",
         page_icon="📊",
         layout="wide",
         initial_sidebar_state="expanded",
     )
 
-    st.title("DMS-Educação × Censo Escolar (contexto municipal)")
-    st.caption(
-        "**Modo simples** orienta pelo município e pré-mapeia colunas típicas de INEP. "
-        "**Modo avançado** abre todas as ferramentas técnicas (mapeamentos manuais, diagnósticos detalhados)."
-    )
-
+    modo_op = ui_mode.modo_sidebar_radio()
     with st.sidebar:
-        st.header("Ajuda rápida")
-        st.markdown(
-            "- Fluxo típico: **carregar Escola (+ Matrícula)** → definir UF/município → consolidar municipal "
-            "→ **DMS** → **Etapa 2 normalizar CNPJ** → **Etapa 3 merge primeiro por CNPJ determinístico** "
-            "(texto apenas sem CNPJ válido na DMS).\n"
-            "- Export **consolidado** na Etapa 3.\n"
-            "- Logs: `outputs/app.log` · **⋮ → Clear cache** quando trocar ficheiros grandes."
-        )
+        if modo_op:
+            ex = st.number_input(
+                "Ano do Censo",
+                min_value=1996,
+                max_value=2050,
+                value=int(st.session_state.get("ctx_exercise_default", 2025)),
+                step=1,
+                key="cif_operacional_ctx_exercise",
+                help="Referência temporal registada nos metadados da base Escola⊕Matrícula e da base integrada final.",
+            )
+            st.session_state["ctx_exercise_default"] = int(ex)
+            ui_mode.salvador_sidebar_contexto_ui(int(ex))
+            st.checkbox(
+                "Processar automaticamente quando os três arquivos forem válidos",
+                value=bool(st.session_state.get(ui_mode.AUTO_PROCESS_KEY, True)),
+                key=ui_mode.AUTO_PROCESS_KEY,
+                help="Quando há um novo trio de ficheiros carregados, o encadeamento completo pode correr neste rerun.",
+            )
+        else:
+            st.header("Ajuda rápida")
+            st.markdown(
+                "- Fluxo típico (modo **Técnico**): **carregar Escola (+ Matrícula)** → definir UF/município → consolidar Escola⊕Matrícula "
+                "→ **DMS** → **Etapa 2** (CNPJ) → **Etapa 3 — cruzamento** (primeiro por CNPJ).\n\n"
+                "- Export **base integrada** ao fim da Etapa 3.\n\n"
+                "- Logs em `outputs/app.log` · use **⋮ → Clear cache** ao trocar ficheiros muito grandes."
+            )
         APP_DIR.mkdir(parents=True, exist_ok=True)
         (APP_DIR / "uploads").mkdir(parents=True, exist_ok=True)
         (APP_DIR / "outputs").mkdir(parents=True, exist_ok=True)
 
-    st.header("1. Carregar bases")
+    if modo_op:
+        _main_operacional_ui()
+        return
+
+    st.title("DMS-Educação × Censo Escolar (contexto municipal)")
     st.caption(
-        "Separe sempre **DMS** (fiscal), **Escola INEP/export** e, se disponível, a agregação de **Matrículas**. "
-        "O nome dos ficheiros não importa — só precisamos de CSV/XLSX íntegro."
+        "**Modo simples** orienta pelo município e pré-mapeia colunas típicas de INEP. "
+        "**Modo avançado** expõe todos os diagnósticos e mapeamentos explícitos."
     )
 
-    u1, u2, u3 = st.columns(3)
-    with u1:
-        up_dms = st.file_uploader(
-            dataset_kind_label(DatasetKind.DMS_EDUCACAO),
-            type=["csv", "xlsx"],
-            key="upload_slot_dms",
-            help="Exportação da DMS-Educação (CSV ou Excel).",
-        )
-    with u2:
-        up_escola = st.file_uploader(
-            dataset_kind_label(DatasetKind.CENSO_ESCOLA),
-            type=["csv", "xlsx"],
-            key="upload_slot_censo_escola",
-            help="Tabela de escolas do Censo (qualquer exercício).",
-        )
-    with u3:
-        up_mat = st.file_uploader(
-            dataset_kind_label(DatasetKind.CENSO_MATRICULA),
-            type=["csv", "xlsx"],
-            key="upload_slot_censo_matricula",
-            help="Opcional mas recomenda-se para pré-filtrar antes do merge nacional.",
-        )
+    up_dms, up_escola, up_mat = ui_upload.render_secao_carregar_arquivos(compacto_operacional=False)
 
     ux_mode_choice = st.radio(
         "**Modo de trabalho**",
         [UX_SIMPLES, UX_AVANCADO],
         horizontal=False,
         key="ux_flow_mode_radio",
-        help="O modo simples esconde mapeamentos técnicos até ser realmente preciso corrigi-los manualmente.",
+        help="O modo simples esconde mapeamentos até ser preciso corrigi-los manualmente.",
     )
     ui_simples = ux_mode_choice == UX_SIMPLES
 
@@ -1494,7 +1703,12 @@ def main() -> None:
     )
     exercise_year_ctx = int(geo_ctx_snapshot["exercise"])
 
-    if st.button("Consolidar Censo municipal (Escola ⊕ Matrícula)", type="primary", key="btn_consolidar_censo"):
+    btn_consolidation = (
+        "Gerar base integrada municipal (Escola ⊕ Matrícula)"
+        if ui_simples
+        else "Consolidar Censo municipal (Escola ⊕ Matrícula)"
+    )
+    if st.button(btn_consolidation, type="primary", key="btn_consolidar_censo"):
         map_e_click = resolve_escola_mapping(cols_esc, ui_simples=ui_simples)
         map_m_click = resolve_matricula_mapping(list(map(str, df_mat.columns)) if df_mat is not None else None, ui_simples=ui_simples)
 
@@ -1565,7 +1779,9 @@ def main() -> None:
                 merged_final = append_censo_context_columns(merged_out, geo_ctx_snapshot)
                 st.session_state["censo_consolidado_df"] = merged_final
                 LOG.debug("Mapeamento escola aplicado: %s | matricula: %s", map_e_click, map_m_click)
-                st.success(f"Censo consolidado (**{len(merged_final.index):,}** linhas**) com metadados de contexto.")
+                st.success(
+                    f"**Base Escola⊕Matrícula** municipal (**{len(merged_final.index):,}** linhas**) com metadados de contexto."
+                )
 
                 stale_sig_anchor = tuple(
                     sorted(
@@ -1614,20 +1830,21 @@ def main() -> None:
     )
 
     if isinstance(censo_consolidado, pd.DataFrame):
-        st.subheader("Base Censo consolidada disponível nesta sessão")
+        st.subheader("Base Escola⊕Matrícula — disponível nesta sessão")
         meta_cols = [
             c
             for c in censo_consolidado.columns
             if str(c).startswith(("censo_", "censo_ctx_")) or str(c) == "censo_exercicio"
         ]
         if meta_cols:
-            st.caption("Metadados colados à consolidação: " + ", ".join(f"`{c}`" for c in meta_cols[:11]))
+            st.caption("Metadados na base integrada municipal: " + ", ".join(f"`{c}`" for c in meta_cols[:11]))
         st.dataframe(censo_consolidado.head(30), use_container_width=True, height=360)
         if sig_store is not None and sig_store != current_sig_attempt:
             st.warning(
                 "Os ficheiros, o modo UX, os mapeamentos **ou** o contexto municipal/exercício mudaram "
-                "**desde a última consolidação bem-sucedida**. Clique novamente em **Consolidar** para manter "
-                "a base alinhada com o formulário atual."
+                "**desde a última consolidação bem-sucedida**. Clique novamente **Gerar base integrada municipal** "
+                "(ou **Consolidar…**) para manter "
+                "a base alinhada com o formulário actual."
             )
 
     st.divider()

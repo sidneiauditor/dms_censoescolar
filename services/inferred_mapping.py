@@ -60,6 +60,16 @@ DMS_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
+# Ordem própria do modo **operacional** (export DMS-Educação com cabeçalhos como ``NUCNPJ``).
+DMS_OPERACIONAL_CNPJ_PRIORITY_ALIASES: tuple[str, ...] = (
+    "NUCNPJ",
+    "NU_CNPJ",
+    "CNPJ",
+    "CPF_CNPJ",
+    "CNPJCPF",
+)
+
+
 def propose_escola_mapping(columns: list[str]) -> dict[str, str]:
     proposed: dict[str, str] = {}
     cols = [str(c) for c in columns]
@@ -91,6 +101,30 @@ def propose_dms_mapping(columns: list[str]) -> dict[str, str]:
             proposed[logical] = hit
             LOG.debug("Auto-map DMS: %s ← %s", logical, hit)
     return proposed
+
+
+def infer_dms_cnpj_column_operacional(columns: Iterable[str]) -> tuple[str | None, str]:
+    """
+    Resolver CNPJ da DMS apenas no fluxo **operacional**.
+
+    Percorre ``DMS_OPERACIONAL_CNPJ_PRIORITY_ALIASES`` na ordem; compara contra cabeçalhos físicos usando
+    :func:`normalize_identifier` para tolerar espaços/caixa variantes sem alterar ``propose_dms_mapping`` dos demais fluxos.
+
+    Devolve ``(nome_da_coluna_encontrado, etiqueta_metodo_logs)``.
+    """
+
+    cols_str = [str(c).strip() for c in columns if str(c).strip()]
+    index = {normalize_identifier(c): c for c in cols_str}
+    for alias in DMS_OPERACIONAL_CNPJ_PRIORITY_ALIASES:
+        key = normalize_identifier(alias)
+        if key in index:
+            resolved = index[key]
+            method = (
+                f"modo_operacional_prioridade(alias_normalizado={key!s}, primeiro_match_na_ordem_dms_export)"
+            )
+            LOG.debug("infer_dms_cnpj_column_operacional: %s → %s (%s)", alias, resolved, method)
+            return resolved, method
+    return None, ""
 
 
 CONSOLIDADO_CNPJ_MERGE_FALLBACK_PRIORITY: tuple[str, ...] = (
