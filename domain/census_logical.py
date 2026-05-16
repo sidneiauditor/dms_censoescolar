@@ -37,6 +37,18 @@ CENSO_ESCOLA_FIELDS: tuple[LogicalFieldSpec, ...] = (
         "CNPJ",
         "CNPJ para cruzamento fiscal, se existir na tabela escola (ex.: ``NU_CNPJ_ESCOLA_PRIVADA``).",
     ),
+    LogicalFieldSpec(
+        "SG_UF",
+        "Sigla da UF para filtro municipal (ex.: ``SG_UF`` nos microdados INEP). Opcional.",
+    ),
+    LogicalFieldSpec(
+        "CO_MUNICIPIO",
+        "Código IBGE do município (ex.: ``CO_MUNICIPIO``). Opcional — necessário para filtrar só escolas municipais.",
+    ),
+    LogicalFieldSpec(
+        "NO_MUNICIPIO",
+        "Nome do município no Censo (ex.: ``NO_MUNICIPIO``). Opcional — útil quando não há só código.",
+    ),
 )
 
 CENSO_MATRICULA_FIELDS: tuple[LogicalFieldSpec, ...] = (
