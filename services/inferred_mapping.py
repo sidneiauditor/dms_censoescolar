@@ -91,3 +91,53 @@ def propose_dms_mapping(columns: list[str]) -> dict[str, str]:
             proposed[logical] = hit
             LOG.debug("Auto-map DMS: %s ← %s", logical, hit)
     return proposed
+
+
+CONSOLIDADO_CNPJ_MERGE_FALLBACK_PRIORITY: tuple[str, ...] = (
+    "CNPJ",
+    "CNPJ_base_escola",
+    "CNPJ_base_matricula",
+)
+
+
+def resolve_census_cnpj_physical_column(columns: Iterable[str]) -> str | None:
+    """
+    Localiza uma coluna de CNPJ **após consolidar Escola⊕Matrícula**.
+
+    O alias INEP habitual costuma ficar igual a ``CNPJ``; quando ambas as tabelas têm coluna física chamada assim,
+    ``census_consolidator`` pode produzir ``CNPJ_base_escola`` / ``CNPJ_base_matricula``.
+    """
+
+    cols = [str(c) for c in columns]
+
+    inferred = propose_escola_mapping(list(cols)).get("CNPJ")
+    if inferred and inferred in cols:
+        LOG.debug("CNPJ censo resolver: usar proposta `%s`.", inferred)
+        return inferred
+
+    for cand in CONSOLIDADO_CNPJ_MERGE_FALLBACK_PRIORITY:
+        if cand in cols:
+            LOG.debug("CNPJ censo resolver: fallback prioritário `%s`.", cand)
+            return cand
+
+    # Colunas tipo ``CNPJ_base_escola`` que escaparam aos casos acima:
+    nk_cnpj = normalize_identifier("CNPJ")
+    prefix_hits = [c for c in cols if normalize_identifier(c).startswith(f"{nk_cnpj}_")]
+
+    def _prio_fallback(name: str) -> tuple[int, str]:
+        nid = normalize_identifier(name)
+        if nid == "CNPJ_BASE_ESCOLA":
+            order = 0
+        elif nid == "CNPJ_BASE_MATRICULA":
+            order = 1
+        else:
+            order = 9
+        return (order, name)
+
+    if prefix_hits:
+        prefix_hits = sorted(prefix_hits, key=_prio_fallback)
+        pick = prefix_hits[0]
+        LOG.warning("CNPJ censo resolver: heurística de sufixo `%s`.", pick)
+        return pick
+
+    return None

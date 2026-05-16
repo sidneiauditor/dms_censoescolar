@@ -87,6 +87,11 @@ def deterministic_merge_by_cnpj(
         raise ValueError(f"Coluna DMS esperada ausente: {col_dms_raw_cnpj!r}.")
     if col_dms_norm not in dm.columns:
         raise ValueError(f"Finalize a Etapa 2 — falta `{col_dms_norm}`.")
+    if col_censo_norm not in cen.columns:
+        raise ValueError(
+            f"Censo de trabalho sem `{col_censo_norm}`. Esta coluna deve ser criada antes do merge "
+            f"determinístico com `utils.cnpj.add_normalized_cnpj_column` sobre a coluna física CNPJ municipal."
+        )
 
     n_dms = len(dm.index)
     n_censo = len(cen.index)

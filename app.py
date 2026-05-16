@@ -8,7 +8,9 @@ Arquitetura (UX atual):
 - **Modo avançado** — mapeamento lógico explícito (todas as colunas) + opção de desativar filtro municipal.
 - **Consolidação** — apenas escolas do município (por defeito) ⊕ Matrícula recortada ao mesmo conjunto de
   ``CO_ENTIDADE`` quando possível; colunas lógicas estáveis no resultado.
-- **Etapa 2** — vínculo DMS ↔ Censo municipal já “pensado”: CNPJ, nome, matrículas onde existirem.
+- **Etapa 2** — apontar colunas físicas CNPJ nos dois datasets; sempre que há par válido são criadas
+  ``__cnpj_norm_dms`` e ``__cnpj_norm_censo``. Antes da Etapa 3 a função ``ensure_normalized_cnpj_workframes`` volta
+  a aplicar ``add_normalized_cnpj_column`` usando o consolidado + resoluções automáticas (ex.: ``CNPJ_base_escola``).
 - **Etapa 3** — **merge determinístico por CNPJ** como chave; RapidFuzz só opcional/complementar nas linhas da
   DMS **sem** CNPJ utilizável → menos falsos positivos.
 """
@@ -48,7 +50,12 @@ from services.cnpj_merge import (
     merge_status_qualifies_textual_complement,
     stitch_complementary_textual_into_base,
 )
-from services.inferred_mapping import propose_dms_mapping, propose_escola_mapping, propose_matricula_mapping
+from services.inferred_mapping import (
+    propose_dms_mapping,
+    propose_escola_mapping,
+    propose_matricula_mapping,
+    resolve_census_cnpj_physical_column,
+)
 from services.municipality_filter import filter_escola_by_municipality, restrict_matricula_to_entidades
 from services.table_loader import load_dataset_bundle, spinner_message
 from services.text_fuzzy_merge import run_textual_fuzzy_merge
@@ -62,6 +69,84 @@ UX_SIMPLES = "Simples (recomendado) — município + automático"
 UX_AVANCADO = "Avançado — mapeamento manual e diagnósticos"
 
 LOG = logging.getLogger(__name__)
+
+
+def ensure_normalized_cnpj_workframes(
+    *,
+    column_map: dict[str, Any],
+    df_dms: pd.DataFrame,
+    df_censo_consolidado: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]] | None:
+    """
+    Etapa obrigatória antes do merge determinístico: cria ``__cnpj_norm_dms`` e ``__cnpj_norm_censo`` via
+    :func:`add_normalized_cnpj_column`.
+
+    Também corrige cenários onde o consolidado ganhou nomes tipo ``CNPJ_base_escola`` após Escola⊕Matrícula
+    (:func:`~services.inferred_mapping.resolve_census_cnpj_physical_column`).
+    """
+
+    cm_out: dict[str, Any] = dict(column_map or {})
+    d_cols = {str(c) for c in df_dms.columns}
+
+    dms_pick = cm_out.get("dms_cnpj")
+    if (
+        not isinstance(dms_pick, str)
+        or dms_pick == SELECT_SENTINEL
+        or not dms_pick.strip()
+        or dms_pick not in d_cols
+    ):
+        inferred_d = propose_dms_mapping([str(c) for c in df_dms.columns]).get("CNPJ")
+        if inferred_d and inferred_d in df_dms.columns:
+            dms_pick = inferred_d
+            cm_out["dms_cnpj"] = inferred_d
+            LOG.info(
+                "CNPJ DMS inferido automaticamente para normalização Etapa 3: `%s`.",
+                inferred_d,
+            )
+        else:
+            st.error(
+                "**DMS**: não conseguimos localizar uma coluna de CNPJ física válida neste arquivo. Na Etapa 2 "
+                "escolha manualmente a coluna do contribuinte."
+            )
+            return None
+
+    censo_pick = cm_out.get("censo_cnpj")
+    if (
+        not isinstance(censo_pick, str)
+        or censo_pick == SELECT_SENTINEL
+        or not censo_pick.strip()
+        or censo_pick not in df_censo_consolidado.columns
+    ):
+        resolved_c = resolve_census_cnpj_physical_column(df_censo_consolidado.columns)
+        if resolved_c:
+            censo_pick = resolved_c
+            cm_out["censo_cnpj"] = resolved_c
+            LOG.info(
+                "Coluna física CNPJ censo inferida antes do merge: `%s` (fallback sufixo merge possível).",
+                resolved_c,
+            )
+        else:
+            st.error(
+                "**Censo municipal sem coluna CNPJ reconhecida.** Inclua o campo lógico **`CNPJ`** no mapeamento "
+                "da Escola (INEP) ou verifique se o consolidado expõe ``CNPJ_base_escola`` / ``CNPJ_base_matricula``."
+            )
+            return None
+
+    dms_work = add_normalized_cnpj_column(df_dms, dms_pick, "__cnpj_norm_dms")
+    censo_work = add_normalized_cnpj_column(df_censo_consolidado, censo_pick, "__cnpj_norm_censo")
+
+    if "__cnpj_norm_dms" not in dms_work.columns or "__cnpj_norm_censo" not in censo_work.columns:
+        st.error("Falha ao materializar colunas internas ``__cnpj_norm_*`` — contacte a equipa técnica.")
+        return None
+
+    norm_censo = censo_work["__cnpj_norm_censo"].astype(str).str.strip()
+    if not (norm_censo.str.len() > 0).any():
+        st.warning(
+            f"A coluna **`{censo_pick}`** existe, mas **não há CNPJ normalizável** (14 dígitos) nas linhas — "
+            "confirme o mapeamento ou se a base municipal realmente contém PJ com número de inscrição."
+        )
+
+    return dms_work, censo_work, cm_out
 
 
 def configure_logging() -> None:
@@ -404,8 +489,9 @@ def run_etapa2_mapping(
         prop_q = dm.get("quantidade")
         if isinstance(prop_q, str) and prop_q in cols_d:
             st.session_state["map_dms_qtd"] = prop_q
-        if "CNPJ" in cols_c:
-            st.session_state["map_censo_cnpj"] = "CNPJ"
+        hit_cnpj_cons = resolve_census_cnpj_physical_column(list(cols_c))
+        if hit_cnpj_cons:
+            st.session_state["map_censo_cnpj"] = hit_cnpj_cons
         if "NO_ENTIDADE" in cols_c:
             st.session_state["map_censo_nome"] = "NO_ENTIDADE"
         if "matriculas" in cols_c:
@@ -569,7 +655,16 @@ def run_etapa3_merge_pipeline(
         st.error("Finalize a Etapa 2 definindo explicitamente as colunas de CNPJ DMS.")
         return
     if "__cnpj_norm_dms" not in dms_work.columns:
-        st.error("Faltam normalizações internas da Etapa 2 — volte atrás para regenerar ``__cnpj_norm_dms``.")
+        st.error(
+            "Falta ``__cnpj_norm_dms`` na DMS transformada — a normalização deveria aplicar‑se assim que as colunas "
+            "CNPJ forem válidas. Recarregue os ficheiros ou limpe cache e gere novamente a Etapa 2."
+        )
+        return
+    if "__cnpj_norm_censo" not in censo_work.columns:
+        st.error(
+            "Falta ``__cnpj_norm_censo`` na base municipal de trabalho — o passo de normalização deveria ter corrido "
+            "logo após a Etapa 2. Volte a carregar ficheiros ou use **Clear cache** e reconsolide."
+        )
         return
 
     det_clicked = st.button(
@@ -1174,15 +1269,32 @@ def _maybe_continue_dms_etapas(
         up_escola_name=str(escola_nm),
     )
 
-    dms_work = st.session_state.get("dms_work")
-    censo_work = st.session_state.get("censo_work")
-    if isinstance(dms_work, pd.DataFrame) and isinstance(censo_work, pd.DataFrame):
-        run_etapa3_merge_pipeline(dms_work, censo_work, ux_simples=ui_simples)
-    else:
+    cm_live = dict(st.session_state.get("column_map") or {})
+    rebuilt = ensure_normalized_cnpj_workframes(
+        column_map=cm_live,
+        df_dms=dms_df,
+        df_censo_consolidado=censo_consolidado,
+    )
+    if rebuilt is None:
         if ui_simples:
-            st.info("Assim que escolher o **CNPJ** na DMS e no Censo desbloqueia o matching texto.")
+            st.info(
+                "Precisamos de **colunas físicas válidas em ambas bases** antes do merge pela chave **CNPJ**. "
+                "Use a Etapa 2 quando as mensagens de erro acima forem sanadas."
+            )
         else:
-            st.warning("Complete Etapa 2 com o par **CNPJ** para habilitar Etapa 3.")
+            st.warning("Corrija o mapeamento de **CNPJ** na Etapa 2 para continuar até ao merge determinístico.")
+        return
+
+    dms_work_ready, censo_work_ready, cm_new = rebuilt
+    st.session_state["column_map"] = cm_new
+    st.session_state["dms_work"] = dms_work_ready
+    st.session_state["censo_work"] = censo_work_ready
+    if cm_new.get("dms_cnpj"):
+        st.session_state["map_dms_cnpj"] = cm_new["dms_cnpj"]
+    if cm_new.get("censo_cnpj"):
+        st.session_state["map_censo_cnpj"] = cm_new["censo_cnpj"]
+
+    run_etapa3_merge_pipeline(dms_work_ready, censo_work_ready, ux_simples=ui_simples)
 
 
 if __name__ == "__main__":

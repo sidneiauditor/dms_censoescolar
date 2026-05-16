@@ -15,8 +15,9 @@ python -m streamlit run app.py
 2. **Modo simples / avançado** — modo simples esconde mapeamentos INEP até ser inevitável; avançado mostra todas as associações lógicas.
 3. **Etapa 0** — ano de exercício (``censo_exercicio``) + UF + município (filtro antes do merge, por defeito); no avançado pode desativar o recorte territorial.
 4. **Consolidar Censo municipal** — aplicar filtro territorial bruto ⇢ recortar matrícula ao mesmo ``CO_ENTIDADE`` quando possível ⇢ ``consolidate_census_escolar``; gravar metadados `censo_ctx_*` quando há filtro.
-5. **Etapa 2** — normalização **somente dígitos + 14 posições** (`utils.cnpj` → colunas ``__cnpj_norm_*``).
-6. **Etapa 3** — primeiro **merge igualdade estrita de CNPJ** (`services/cnpj_merge.py`); texto (`services/text_fuzzy_merge.py`) apenas para linhas onde a DMS **não** tem CNPJ normalizável/validado segundo `classify_cnpj_cell`, evitando falsos positivos.
+5. **Etapa 2** — escolha as colunas físicas de contribuinte. As colunas internas são criadas com **`utils.cnpj.add_normalized_cnpj_column`** (somente dígitos, até 14 com `zfill`).
+6. **Antes da Etapa 3** — `ensure_normalized_cnpj_workframes` em `app.py` reaplica sempre `add_normalized_cnpj_column` ao upload **DMS** e ao DataFrame **`censo_consolidado`**, combinando os valores persistidos em `column_map`. Se apenas existirem variantes tipo ``CNPJ_base_escola`` / ``CNPJ_base_matricula`` após Escola⊕Matrícula, `resolve_census_cnpj_physical_column` (`inferred_mapping.py`) descobre a coluna física correta e daí surge **`__cnpj_norm_censo`**.
+7. **Etapa 3** — primeiro **merge igualdade estrita de CNPJ** (`services/cnpj_merge.py`); texto (`services/text_fuzzy_merge.py`) apenas para linhas onde a DMS **não** tem CNPJ normalizável/validado segundo `classify_cnpj_cell`.
 
 ## Merge determinístico (Etapa 3)
 
@@ -36,7 +37,7 @@ Saídas típicas: `outputs/consolidado.xlsx`, `outputs/app.log`.
 |------------------|--------|
 | `app.py` | Orquestração Streamlit — Etapa 0, modos, Etapas 2–3. |
 | `domain/census_logical.py` | Papéis lógicos Escola/Matrícula (+ UF/município). |
-| `services/inferred_mapping.py` | Propostas automáticas de nomes físicos típicos. |
+| `services/inferred_mapping.py` | Propostas automáticas INEP/export + **`resolve_census_cnpj_physical_column`** (inclui sufixos ``CNPJ_base_*``). |
 | `services/municipality_filter.py` | Filtro antes do merge. |
 | `services/census_consolidator.py` | Junção Escola ⊕ Matrícula lógicas. |
 | `services/cnpj_merge.py` | Merge igualdade de CNPJ + estados + costura texto opcional. |
