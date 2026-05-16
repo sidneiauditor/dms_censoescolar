@@ -11,8 +11,8 @@ Arquitetura (UX atual):
 - **Etapa 2** — apontar colunas físicas CNPJ nos dois datasets; sempre que há par válido são criadas
   ``__cnpj_norm_dms`` e ``__cnpj_norm_censo``. Antes da Etapa 3 a função ``ensure_normalized_cnpj_workframes`` volta
   a aplicar ``add_normalized_cnpj_column`` usando o consolidado + resoluções automáticas (ex.: ``CNPJ_base_escola``).
-- **Etapa 3** — **merge determinístico por CNPJ** como chave; RapidFuzz só opcional/complementar nas linhas da
-  DMS **sem** CNPJ utilizável → menos falsos positivos.
+- **Etapa 3** — merge determinístico por CNPJ; RapidFuzz opcional só sem CNPJ DMS válido.
+- **Etapa 6.1** — indicadores fiscais básicos (ISS, mensalidade, base de cálculo por matrícula) no consolidado — ver :mod:`services.indicators`.
 """
 
 from __future__ import annotations
@@ -51,6 +51,12 @@ from services.cnpj_merge import (
     deterministic_merge_by_cnpj,
     merge_status_qualifies_textual_complement,
     stitch_complementary_textual_into_base,
+)
+from services.indicators import (
+    COL_BASE_PM,
+    COL_ISS_PM,
+    COL_MSG_PM,
+    add_basic_fiscal_indicators,
 )
 from services.inferred_mapping import (
     propose_dms_mapping,
@@ -839,6 +845,8 @@ def run_etapa3_merge_pipeline(
             return
 
         prog.empty()
+        cm_for_ind = dict(st.session_state.get("column_map") or {})
+        consolidado_cnpj, _report61 = add_basic_fiscal_indicators(consolidado_cnpj, cm_for_ind)
         st.session_state["consolidado_df"] = consolidado_cnpj
         st.session_state.pop("consolidado_summary", None)
         st.session_state["etapa3_cnpj_summary"] = summary_cnpj
@@ -883,6 +891,12 @@ def run_etapa3_merge_pipeline(
             "**Colunas CNPJ ou tamanhos das bases mudaram** face ao último merge determinístico. "
             "Volte a executar **merge por CNPJ (14 dígitos)** para manter dados consistentes."
         )
+
+    consolidado_raw, etapa61_report = add_basic_fiscal_indicators(
+        consolidado_raw,
+        dict(cm or {}),
+    )
+    st.session_state["consolidado_df"] = consolidado_raw
 
     texto_elegivel_n = 0
     if "match_status_principal" in consolidado_raw.columns:
@@ -977,6 +991,10 @@ def run_etapa3_merge_pipeline(
                         fz_resultado,
                         score_cutoff_used=float(cutoff),
                     )
+                    consolidado_atualizado, _ = add_basic_fiscal_indicators(
+                        consolidado_atualizado,
+                        dict(st.session_state.get("column_map") or {}),
+                    )
                     st.session_state["consolidado_df"] = consolidado_atualizado
                     st.session_state["etapa3_comp_text_summary"] = texto_sumario
                     st.session_state["etapa3_fuzzy_sig"] = (col_razao, col_nome, int(cutoff))
@@ -1022,6 +1040,74 @@ def run_etapa3_merge_pipeline(
     segundo[2].metric("CNPJ DMS classificado como inválido (DV/formato)", f"{summary_actual.cnpj_dms_invalido:,}")
     segundo[3].metric("Tempo passe determinístico (s)", f"{summary_actual.tempo_segundos:.3f}")
 
+    st.divider()
+    st.header("Etapa 6 — Indicadores fiscais básicos (6.1)")
+    st.markdown(
+        "Ratios económico‑educacionais **por linha** do consolidado: valores fiscais da **DMS** "
+        "(prefixo `dms__`) sobre **matrículas do Censo** (`censo__…`, por defeito a coluna lógica `matriculas` "
+        "ou o campo escolhido na Etapa 2). Colunas criadas sem prefixo para export: "
+        f"`{COL_ISS_PM}`, `{COL_MSG_PM}`, `{COL_BASE_PM}`."
+    )
+    with st.expander("Arquitetura dos indicadores 6.1 (equipa técnica)", expanded=False):
+        st.markdown(
+            "- **Resolução de colunas** — são procuradas colunas físicas no consolidado com prefixos estáveis "
+            "(`dms__` / `censo__`) usando listas de aliases (ex.: `VLIMPOSTO`, `VLMENSALIDADE`) e eventualmente "
+            "`column_map.censo_mat` para o denominador de matrículas.\n"
+            "- **Numerador × denominador** — cada métrica é `numerador / matrículas` na mesma linha já alinhada "
+            "pelo merge DMS×Censo (Chave determinística Etapa 3).\n"
+            "- **Sanitização** — `NaN`/texto ilegível tratados com `pandas.to_numeric(..., coerce)`; denominador "
+            "≤ 0 ou `NaN` gera resultado `NaN` (sem divisão nem `inf`; qualquer residual infinito é coagido).\n"
+            "- **Persistência** — as colunas de indicadores são escritas diretamente no `DataFrame` do consolidado "
+            "salvo na sessão e no descarregar Excel logo abaixo."
+        )
+
+    cols_resolv = etapa61_report.colunas_resolvidas
+    src_txt = ", ".join(
+        f"`{logical}` ← `{physical or '—'}`"
+        for logical, physical in cols_resolv.items()
+    )
+    st.caption("Colunas físicas efectivas esta sessão / último rerun: " + src_txt)
+
+    for av in etapa61_report.avisos:
+        st.warning(av)
+
+    st.subheader("Métricas resumidas (só valores finitos)")
+    cols_stats = sorted(etapa61_report.resumos, key=lambda x: x.nome)
+
+    def _fmt_stat(v: float | None) -> str:
+        return "—" if v is None else f"{v:,.6g}"
+
+    for row_i in range(0, len(cols_stats), 3):
+        chunk = cols_stats[row_i : row_i + 3]
+        grid = st.columns(len(chunk))
+        for j, stt in enumerate(chunk):
+            with grid[j]:
+                st.markdown(f"**{stt.nome}** — *n válidos*: {stt.n_validos}")
+                g1, g2, g3, g4 = st.columns(4)
+                g1.metric("média", _fmt_stat(stt.media))
+                g2.metric("mediana", _fmt_stat(stt.mediana))
+                g3.metric("máximo", _fmt_stat(stt.maximo))
+                g4.metric("mínimo", _fmt_stat(stt.minimo))
+
+    ind_cols = [c for c in (COL_ISS_PM, COL_MSG_PM, COL_BASE_PM) if c in refinado.columns]
+    extra_src = [
+        cols_resolv.get("matriculas_denominador"),
+        cols_resolv.get("VLIMPOSTO_numerador"),
+        cols_resolv.get("VLMENSALIDADE_numerador"),
+        cols_resolv.get("VLBASECALCULO_numerador"),
+    ]
+    show_ind61 = list(
+        dict.fromkeys(ind_cols + [c for c in extra_src if isinstance(c, str) and c in refinado.columns])
+    )
+
+    st.subheader("Pré-visualização — indicadores")
+    if show_ind61:
+        st.dataframe(refinado.loc[:, show_ind61].head(200), use_container_width=True, height=320)
+    elif not ind_cols:
+        st.info(
+            "Indicadores não materializados nesta sessão — verifique colunas fiscais na DMS e matrículas no Censo."
+        )
+
     texto_extra = st.session_state.get("etapa3_comp_text_summary")
     if texto_extra:
         z1, z2, z3 = st.columns(3)
@@ -1033,7 +1119,8 @@ def run_etapa3_merge_pipeline(
             fra, fro, fc = fz_sig
             st.caption(f"Último passe texto rápido: **`{fra}` × `{fro}`** · cutoff WRatio **≥ {fc}**.")
 
-    st.subheader("Pré-visualização + export")
+    st.divider()
+    st.header("Pré-visualização + export (consolidado)")
     filt = st.radio(
         "Segmentar resultado",
         [
