@@ -1,12 +1,18 @@
 """
-App local Streamlit — cruzamento DMS-Educação × Censo Escolar (Etapas incrementais).
+App local Streamlit — cruzamento DMS-Educação × Censo Escolar.
 
-Etapa 2: ingestão DMS com cabeçalho automático, Censo padrão, mapeamento de colunas,
-normalização métricas de CNPJ, cache Streamlit para leituras pesadas.
+Arquitetura:
+- Carregamento **genérico** (qualquer nome de ficheiro) tipificado como DMS / Censo Escola / Censo Matrícula.
+- **Campos lógicos** estáveis (CO_ENTIDADE, NO_ENTIDADE, …) mapeados sobre colunas físicas variáveis por exercício.
+- **Consolidação interna** Escola ⊕ Matrícula por CO_ENTIDADE.
+- Etapas seguintes operam sempre sobre o **Censo consolidado**, independentemente do ano (metadado ``censo_exercicio``).
+
+Etapa 3: matching textual RapidFuzz entre DMS e base Censo consolidada.
 """
 
 from __future__ import annotations
 
+import io
 import logging
 import sys
 from pathlib import Path
@@ -15,7 +21,15 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from services.ingest_cache import load_censo_cached, load_dms_cached
+from domain.census_logical import (
+    CENSO_ESCOLA_FIELDS,
+    CENSO_MATRICULA_FIELDS,
+    LogicalFieldSpec,
+)
+from domain.dataset_kind import DatasetKind, label as dataset_kind_label
+from services.census_consolidator import CensusMergeError, consolidate_census_escolar
+from services.table_loader import load_dataset_bundle, spinner_message
+from services.text_fuzzy_merge import run_textual_fuzzy_merge
 from utils.cnpj import add_normalized_cnpj_column, summarize_cnpj_column
 from utils.file_io import FileValidationError
 
@@ -26,20 +40,30 @@ LOG = logging.getLogger(__name__)
 
 
 def configure_logging() -> None:
-    """Logs simples para ficheiro local + stderr (sem serviços externos)."""
+    """Logs para ficheiro (DEBUG) e consola (INFO). Evita handlers duplicados em reruns Streamlit."""
+
+    root = logging.getLogger()
+    if root.handlers:
+        return
 
     log_dir = APP_DIR / "outputs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "app.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(sys.stderr),
-        ],
-        force=True,
-    )
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    root.setLevel(logging.DEBUG)
+
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+
+    root.addHandler(fh)
+    root.addHandler(sh)
 
 
 def _friendly_file_error(where: str, err: BaseException) -> None:
@@ -61,13 +85,43 @@ def _friendly_file_error(where: str, err: BaseException) -> None:
 
 def _preview_dataframe(title: str, df: pd.DataFrame, caption: str) -> None:
     st.markdown(f"**{title}** — {caption}")
-    st.dataframe(df, use_container_width=True, height=360)
+    st.dataframe(df, use_container_width=True, height=320)
 
 
 def column_options(df: pd.DataFrame | None) -> list[str]:
     if df is None or df.empty:
         return [SELECT_SENTINEL]
     return [SELECT_SENTINEL] + [str(c) for c in df.columns]
+
+
+def collect_logical_mapping(prefix_key: str, specs: tuple[LogicalFieldSpec, ...]) -> dict[str, str]:
+    """Lê ``st.session_state`` preenchido pelos ``selectbox`` de mapeamento lógico."""
+
+    result: dict[str, str] = {}
+    for spec in specs:
+        val = st.session_state.get(f"{prefix_key}_{spec.key}", SELECT_SENTINEL)
+        if val != SELECT_SENTINEL:
+            result[spec.key] = val
+    return result
+
+
+def render_logical_mapper(
+    titulo: str,
+    df: pd.DataFrame,
+    specs: tuple[LogicalFieldSpec, ...],
+    prefix_key: str,
+) -> None:
+    st.markdown(f"#### {titulo}")
+    opts = column_options(df)
+    for spec in specs:
+        obrig = "**obrigatório**" if getattr(spec, "obrigatorio_escola", False) or getattr(
+            spec, "obrigatorio_matricula", False
+        ) else "opcional"
+        st.selectbox(
+            f"`{spec.key}` ({obrig}) — {spec.description_pt}",
+            opts,
+            key=f"{prefix_key}_{spec.key}",
+        )
 
 
 def render_cnpj_stats_block(label: str, df: pd.DataFrame, col_name: str) -> None:
@@ -132,20 +186,24 @@ def run_etapa2_mapping(dms_df: pd.DataFrame, censo_df: pd.DataFrame) -> None:
         )
 
     with c2:
-        st.subheader("Censo Escolar")
+        st.subheader("Censo consolidado")
+        opts_c = column_options(censo_df)
         censo_cnpj = st.selectbox(
             "Coluna CNPJ (Censo)",
-            column_options(censo_df),
+            opts_c,
+            index=default_select_index(opts_c, "CNPJ" if "CNPJ" in censo_df.columns else None),
             key="map_censo_cnpj",
         )
         censo_nome = st.selectbox(
             "Nome da escola (Censo)",
-            column_options(censo_df),
+            opts_c,
+            index=default_select_index(opts_c, "NO_ENTIDADE" if "NO_ENTIDADE" in censo_df.columns else None),
             key="map_censo_nome",
         )
         censo_mat = st.selectbox(
             "Quantidade de matrículas (Censo)",
-            column_options(censo_df),
+            opts_c,
+            index=default_select_index(opts_c, "matriculas" if "matriculas" in censo_df.columns else None),
             key="map_censo_mat",
         )
 
@@ -154,7 +212,7 @@ def run_etapa2_mapping(dms_df: pd.DataFrame, censo_df: pd.DataFrame) -> None:
     with left:
         render_cnpj_stats_block("DMS", dms_df, dms_cnpj)
     with right:
-        render_cnpj_stats_block("Censo", censo_df, censo_cnpj)
+        render_cnpj_stats_block("Censo consolidado", censo_df, censo_cnpj)
 
     if (
         dms_cnpj != SELECT_SENTINEL
@@ -184,8 +242,184 @@ def run_etapa2_mapping(dms_df: pd.DataFrame, censo_df: pd.DataFrame) -> None:
         st.info(
             "Quando selecionar colunas de CNPJ em **ambas** as bases, "
             "serão criadas colunas internas `__cnpj_norm_dms` e `__cnpj_norm_censo` "
-            "apenas em memória (para o cruzamento na Etapa 3)."
+            "em memória. A **Etapa 3** usa também **matching textual** (RapidFuzz)."
         )
+
+
+def default_select_index(options: list[str], preferred: str | None) -> int:
+    """Índice inicial do ``selectbox`` quando o nome preferido existe nas opções."""
+
+    if preferred and preferred in options:
+        return options.index(preferred)
+    return 0
+
+
+def run_etapa3_textual_merge(dms_work: pd.DataFrame, censo_work: pd.DataFrame) -> None:
+    """Matching textual + métricas + preview + export ``consolidado.xlsx``."""
+
+    st.divider()
+    st.header("Etapa 3 — Cruzamento textual (RapidFuzz)")
+    st.caption(
+        "Para cada linha da DMS compara-se a razão social **normalizada** com os nomes "
+        "do Censo consolidado (bloqueio por prefixo para bases grandes). "
+        "Scorer: **WRatio**. Saída: **outputs/consolidado.xlsx**."
+    )
+
+    cm = st.session_state.get("column_map") or {}
+    opts_dms = column_options(dms_work)
+    opts_censo = column_options(censo_work)
+
+    g1, g2 = st.columns(2)
+    with g1:
+        col_razao = st.selectbox(
+            "NM razão social / texto (DMS)",
+            opts_dms,
+            index=default_select_index(opts_dms, cm.get("dms_razao")),
+            key="etapa3_col_dms_razao",
+        )
+    with g2:
+        col_nome = st.selectbox(
+            "Nome da escola (Censo)",
+            opts_censo,
+            index=default_select_index(opts_censo, cm.get("censo_nome")),
+            key="etapa3_col_censo_nome",
+        )
+
+    cutoff = st.radio(
+        "Pontuação mínima RapidFuzz (0–100)",
+        options=[70, 80, 90],
+        index=1,
+        horizontal=True,
+        key="etapa3_cutoff",
+    )
+
+    if col_razao == SELECT_SENTINEL or col_nome == SELECT_SENTINEL:
+        st.warning("Seleccione as duas colunas de texto para executar o matching.")
+        return
+
+    run_clicked = st.button("Executar matching textual", type="primary", key="btn_etapa3_run")
+
+    if run_clicked:
+        prog = st.progress(0)
+
+        def _cb(progress: float) -> None:
+            prog.progress(min(max(progress, 0.0), 1.0))
+
+        try:
+            consolidado, summary = run_textual_fuzzy_merge(
+                dms_work,
+                censo_work,
+                col_dms_razao=col_razao,
+                col_censo_nome=col_nome,
+                score_cutoff=float(cutoff),
+                progress_callback=_cb,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            prog.empty()
+            st.error("Não foi possível concluir o matching textual.")
+            LOG.exception("Etapa 3 — erro")
+            with st.expander("Detalhe técnico"):
+                st.code(str(exc))
+            return
+
+        prog.empty()
+
+        st.session_state["consolidado_df"] = consolidado
+        st.session_state["consolidado_summary"] = summary
+        st.session_state["etapa3_run_signature"] = (col_razao, col_nome, int(cutoff))
+
+        out_path = APP_DIR / "outputs" / "consolidado.xlsx"
+        try:
+            consolidado.to_excel(out_path, index=False, engine="openpyxl")
+            LOG.info(
+                "consolidado.xlsx gravado em %s (%s linhas, %s matches).",
+                out_path,
+                len(consolidado.index),
+                summary.encontrados,
+            )
+            st.success(f"Consolidado gravado em `{out_path}`.")
+        except Exception as exc:  # pylint: disable=broad-except
+            st.warning(f"Gravação em disco falhou (permite mes assim descarregar): {exc}")
+            LOG.exception("Falha ao gravar consolidado.xlsx")
+
+    summary_obj = st.session_state.get("consolidado_summary")
+    consolidado = st.session_state.get("consolidado_df")
+    sig_stored = st.session_state.get("etapa3_run_signature")
+    sig_now = (col_razao, col_nome, int(cutoff))
+
+    if consolidado is None or summary_obj is None:
+        return
+
+    if sig_stored != sig_now:
+        st.info(
+            "**Parâmetros alterados** relativamente ao último resultado (colunas ou corte). "
+            "Clique novamente em **Executar matching textual** para atualizar."
+        )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Linhas DMS", f"{summary_obj.linhas_dms:,}")
+    m2.metric("Matches encontrados", f"{summary_obj.encontrados:,}")
+    m3.metric("Sem correspondência", f"{summary_obj.sem_correspondencia:,}")
+    aderencia = (
+        100.0 * summary_obj.encontrados / summary_obj.linhas_dms
+        if summary_obj.linhas_dms
+        else 0.0
+    )
+    m4.metric("Percentagem match", f"{aderencia:.1f} %")
+
+    st.caption(
+        f"Censo com **{summary_obj.linhas_censo:,}** registos · tempo **{summary_obj.tempo_segundos:.2f} s** · "
+        f"corte **≥ {summary_obj.score_min_usado:.0f}**."
+    )
+
+    filt = st.radio(
+        "Pré-visualização consolidado",
+        ["Todos", "Só matches", "Só sem correspondência"],
+        horizontal=True,
+        key="etapa3_preview_filter",
+    )
+    view = consolidado
+    if filt == "Só matches":
+        view = consolidado.loc[consolidado["match_status"] == "match_textual"].copy()
+    elif filt == "Só sem correspondência":
+        view = consolidado.loc[consolidado["match_status"] == "sem_correspondencia"].copy()
+
+    st.dataframe(view.head(200), use_container_width=True, height=420)
+
+    buf = io.BytesIO()
+    consolidado.to_excel(buf, index=False, engine="openpyxl")
+    st.download_button(
+        label="Descarregar consolidado.xlsx",
+        data=buf.getvalue(),
+        file_name="consolidado.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="dl_consolidado",
+    )
+
+
+def _load_bundle(kind: DatasetKind, uploaded: Any, label_erro: str) -> dict[str, Any] | None:
+    """Carrega upload para estrutura ``bundle`` ou devolve ``None`` com erro na UI."""
+
+    if uploaded is None:
+        return None
+    raw = uploaded.getvalue()
+    fname = uploaded.name
+    try:
+        with st.spinner(spinner_message(kind.value)):
+            bundle = load_dataset_bundle(kind.value, raw, fname)
+        LOG.info(
+            "Carregado %s (%s): linhas=%s colunas=%s",
+            dataset_kind_label(kind),
+            fname,
+            len(bundle["dataframe"].index),
+            len(bundle["dataframe"].columns),
+        )
+        return bundle
+    except (FileValidationError, ValueError) as exc:
+        _friendly_file_error(label_erro, exc)
+    except Exception as exc:  # pylint: disable=broad-except
+        _friendly_file_error(label_erro, exc)
+    return None
 
 
 def main() -> None:
@@ -198,113 +432,224 @@ def main() -> None:
     )
 
     st.title("DMS-Educação × Censo Escolar")
-    st.caption("Etapa 2 — Normalização, validação e mapeamento de colunas (100% local).")
+    st.caption(
+        "Carregamento genérico por **tipo de base**, consolidação Escola⊕Matrícula e etapas de validação/matching textual."
+    )
 
     with st.sidebar:
-        st.header("Sobre")
+        st.header("Metadados")
+        exercise_year = st.number_input(
+            "Exercício do Censo (referência)",
+            min_value=1996,
+            max_value=2050,
+            value=2025,
+            step=1,
+            help="Não altera leitura de ficheiros — fica registado na base consolidada (`censo_exercicio`).",
+        )
+        st.divider()
         st.markdown(
-            "- Processamento **offline** (sem APIs / nuvem).\n"
-            "- DMS: deteção automática de cabeçalho e correção de colunas `Unnamed`.\n"
-            "- **Cache Streamlit** acelera reexecuções com o mesmo ficheiro.\n"
-            "- Limpar cache: menu **⋮** → *Clear cache* se alterar o ficheiro e o preview não atualizar."
+            "- Processamento **offline**.\n"
+            "- Qualquer nome de ficheiro CSV/XLSX.\n"
+            "- **⋮ → Clear cache** após substituir ficheiros.\n"
+            "- Logs: `outputs/app.log`"
         )
-        uploads_dir = APP_DIR / "uploads"
-        outputs_dir = APP_DIR / "outputs"
-        uploads_dir.mkdir(parents=True, exist_ok=True)
-        outputs_dir.mkdir(parents=True, exist_ok=True)
-        st.caption(f"Registos: `{outputs_dir / 'app.log'}`")
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        (APP_DIR / "uploads").mkdir(parents=True, exist_ok=True)
+        (APP_DIR / "outputs").mkdir(parents=True, exist_ok=True)
 
-    col_u1, col_u2 = st.columns(2)
-    with col_u1:
-        dms_upload: Any = st.file_uploader(
-            "DMS-Educação",
+    st.header("1. Carregar bases")
+    st.caption(
+        "Três slots independentes correspondem aos tipos **DMS Educação**, **Censo Escola** e **Censo Matrícula**. "
+        "O ano do microdados é irrelevante para o nome do ficheiro."
+    )
+
+    u1, u2, u3 = st.columns(3)
+    with u1:
+        up_dms = st.file_uploader(
+            dataset_kind_label(DatasetKind.DMS_EDUCACAO),
             type=["csv", "xlsx"],
-            key="upload_dms",
-            help="Relatório exportado da DMS (pode conter linhas de título antes da tabela).",
+            key="upload_slot_dms",
+            help="Exportação da DMS-Educação (CSV ou Excel).",
         )
-    with col_u2:
-        censo_upload: Any = st.file_uploader(
-            "Censo Escolar",
+    with u2:
+        up_escola = st.file_uploader(
+            dataset_kind_label(DatasetKind.CENSO_ESCOLA),
             type=["csv", "xlsx"],
-            key="upload_censo",
-            help="Ficheiro agregado do Censo (CSV `;` ou Excel).",
+            key="upload_slot_censo_escola",
+            help="Tabela de escolas do Censo (qualquer exercício).",
         )
+    with u3:
+        up_mat = st.file_uploader(
+            dataset_kind_label(DatasetKind.CENSO_MATRICULA),
+            type=["csv", "xlsx"],
+            key="upload_slot_censo_matricula",
+            help="Tabela agregada de matrículas (opcional mas recomendada para merge).",
+        )
+
+    dms_bundle = _load_bundle(DatasetKind.DMS_EDUCACAO, up_dms, "DMS-Educação")
+    escola_bundle = _load_bundle(DatasetKind.CENSO_ESCOLA, up_escola, "Censo Escola")
+    mat_bundle = _load_bundle(DatasetKind.CENSO_MATRICULA, up_mat, "Censo Matrícula")
 
     dms_df: pd.DataFrame | None = None
     dms_meta: dict[str, Any] = {}
-    censo_df: pd.DataFrame | None = None
+    df_escola: pd.DataFrame | None = None
+    df_mat: pd.DataFrame | None = None
 
-    if dms_upload is not None:
-        try:
-            raw = dms_upload.getvalue()
-            dms_df, dms_meta = load_dms_cached(raw, dms_upload.name)
-            st.session_state["dms_raw_name"] = dms_upload.name
-            LOG.info(
-                "DMS carregada: %s linhas=%s cols=%s",
-                dms_upload.name,
-                len(dms_df.index),
-                len(dms_df.columns),
-            )
-        except FileValidationError as exc:
-            _friendly_file_error("DMS-Educação", exc)
-        except Exception as exc:  # pylint: disable=broad-except
-            _friendly_file_error("DMS-Educação", exc)
+    if dms_bundle:
+        dms_df = dms_bundle["dataframe"]
+        dms_meta = dms_bundle.get("meta") or {}
+    if escola_bundle:
+        df_escola = escola_bundle["dataframe"]
+    if mat_bundle:
+        df_mat = mat_bundle["dataframe"]
 
-    if censo_upload is not None:
-        try:
-            raw_c = censo_upload.getvalue()
-            censo_df = load_censo_cached(raw_c, censo_upload.name)
-            st.session_state["censo_raw_name"] = censo_upload.name
-            LOG.info(
-                "Censo carregado: %s linhas=%s cols=%s",
-                censo_upload.name,
-                len(censo_df.index),
-                len(censo_df.columns),
-            )
-        except FileValidationError as exc:
-            _friendly_file_error("Censo Escolar", exc)
-        except Exception as exc:  # pylint: disable=broad-except
-            _friendly_file_error("Censo Escolar", exc)
-
-    prev1, prev2 = st.columns(2)
-    with prev1:
-        st.subheader("Pré‑visualização — DMS")
+    pv1, pv2, pv3 = st.columns(3)
+    with pv1:
+        st.subheader("Pré-visualização — DMS")
         if dms_df is None:
-            st.info("Carregue o ficheiro da DMS para ver a amostra.")
+            st.info("Sem ficheiro.")
         else:
-            st.success(
-                f"`{dms_upload.name}` — **{len(dms_df):,}** linhas · **{len(dms_df.columns)}** colunas"
-            )
-            with st.expander("Metadados da deteção de cabeçalho", expanded=False):
-                meta_compact = {
-                    key: value
-                    for key, value in dms_meta.items()
-                    if key != "columns"
-                }
-                st.json(meta_compact)
-                st.caption("Lista de colunas após saneamento:")
-                st.dataframe(
-                    pd.DataFrame({"coluna": dms_meta.get("columns", [])}),
-                    use_container_width=True,
-                    height=240,
-                    hide_index=True,
-                )
-            _preview_dataframe("Amostra de dados", dms_df.head(30), "30 primeiras linhas")
-    with prev2:
-        st.subheader("Pré‑visualização — Censo")
-        if censo_df is None:
-            st.info("Carregue o ficheiro do Censo para ver a amostra.")
+            st.success(f"`{up_dms.name}` · {len(dms_df):,} × {len(dms_df.columns)}")
+            if dms_meta:
+                with st.expander("Meta cabeçalho DMS"):
+                    slim = {k: v for k, v in dms_meta.items() if k != "columns"}
+                    st.json(slim)
+            _preview_dataframe("Amostra", dms_df.head(20), "20 linhas")
+    with pv2:
+        st.subheader("Pré-visualização — Escola")
+        if df_escola is None:
+            st.info("Sem ficheiro.")
         else:
-            st.success(
-                f"`{censo_upload.name}` — **{len(censo_df):,}** linhas · **{len(censo_df.columns)}** colunas"
-            )
-            _preview_dataframe("Amostra de dados", censo_df.head(30), "30 primeiras linhas")
+            st.success(f"`{up_escola.name}` · {len(df_escola):,} × {len(df_escola.columns)}")
+            _preview_dataframe("Amostra", df_escola.head(20), "20 linhas")
+    with pv3:
+        st.subheader("Pré-visualização — Matrícula")
+        if df_mat is None:
+            st.info("Sem ficheiro (opcional).")
+        else:
+            st.success(f"`{up_mat.name}` · {len(df_mat):,} × {len(df_mat.columns)}")
+            _preview_dataframe("Amostra", df_mat.head(20), "20 linhas")
 
-    if dms_df is not None and censo_df is not None:
-        run_etapa2_mapping(dms_df, censo_df)
-    elif dms_df is not None or censo_df is not None:
-        st.divider()
-        st.warning("Carregue **ambos** os ficheiros para concluir o mapeamento da Etapa 2.")
+    st.divider()
+    st.header("2. Mapeamento lógico do Censo")
+    st.caption(
+        "Associe colunas **reais** do ficheiro a papéis estáveis (`CO_ENTIDADE`, …). "
+        "Estes nomes são os utilizados na base consolidada para qualquer exercício."
+    )
+
+    if df_escola is not None:
+        render_logical_mapper(
+            "Tabela Escola",
+            df_escola,
+            CENSO_ESCOLA_FIELDS,
+            "logical_escola",
+        )
+    else:
+        st.warning("Carregue a **tabela Escola** para mapear campos obrigatórios.")
+
+    if df_mat is not None:
+        render_logical_mapper(
+            "Tabela Matrícula",
+            df_mat,
+            CENSO_MATRICULA_FIELDS,
+            "logical_matricula",
+        )
+
+    if df_escola is not None:
+        if st.button("Consolidar Censo (Escola ⊕ Matrícula)", type="primary", key="btn_consolidar_censo"):
+            map_e = collect_logical_mapping("logical_escola", CENSO_ESCOLA_FIELDS)
+            map_m = collect_logical_mapping("logical_matricula", CENSO_MATRICULA_FIELDS)
+            fn_esc = up_escola.name if up_escola else ""
+            fn_mat = up_mat.name if up_mat else ""
+            try:
+                merged = consolidate_census_escolar(
+                    df_escola,
+                    df_mat,
+                    map_e,
+                    map_m,
+                    int(exercise_year),
+                    source_escola_label=fn_esc,
+                    source_matricula_label=fn_mat or "",
+                )
+            except CensusMergeError as exc:
+                st.error(str(exc))
+                LOG.warning("Consolidação Censo recusada: %s", exc)
+            except Exception as exc:  # pylint: disable=broad-except
+                st.error("Erro inesperado na consolidação.")
+                LOG.exception("merge censo")
+                st.code(str(exc))
+            else:
+                st.session_state["censo_consolidado_df"] = merged
+                LOG.debug(
+                    "Mapeamento escola aplicado: %s | matricula: %s",
+                    map_e,
+                    map_m,
+                )
+                st.success(f"Censo consolidado: **{len(merged.index):,}** linhas.")
+                st.session_state["censo_consolidado_signature"] = (
+                    fn_esc,
+                    fn_mat,
+                    int(exercise_year),
+                    tuple(sorted(map_e.items())),
+                    tuple(sorted(map_m.items())),
+                )
+
+    censo_consolidado = st.session_state.get("censo_consolidado_df")
+    sig_store = st.session_state.get("censo_consolidado_signature")
+
+    if isinstance(censo_consolidado, pd.DataFrame):
+        st.subheader("Base Censo consolidada (visão atual)")
+        meta_cols = [
+            c
+            for c in censo_consolidado.columns
+            if str(c).startswith("censo_") or str(c) == "censo_exercicio"
+        ]
+        if meta_cols:
+            st.caption("Metadados: " + ", ".join(f"`{c}`" for c in meta_cols[:8]))
+        _preview_dataframe(
+            "Pré-visualização consolidado",
+            censo_consolidado.head(40),
+            "40 linhas · colunas lógicas + matrículas após merge",
+        )
+
+        current_sig_attempt = (
+            up_escola.name if up_escola else "",
+            up_mat.name if up_mat else "",
+            int(exercise_year),
+            tuple(sorted(collect_logical_mapping("logical_escola", CENSO_ESCOLA_FIELDS).items())),
+            tuple(sorted(collect_logical_mapping("logical_matricula", CENSO_MATRICULA_FIELDS).items())),
+        )
+        if sig_store is not None and sig_store != current_sig_attempt:
+            st.info(
+                "**Nota:** ficheiros, exercício ou mapeamento mudaram desde a última consolidação. "
+                "Volte a clicar em **Consolidar** para alinhar o resultado à UI."
+            )
+
+    st.divider()
+    st.header("3. Cruzamento com DMS")
+
+    if not isinstance(censo_consolidado, pd.DataFrame):
+        st.warning(
+            "Conclua o **mapeamento** e clique em **Consolidar Censo** para gerar a base única do Censo."
+        )
+        return
+
+    if dms_df is None:
+        st.info(
+            "Para **Etapa 2** (CNPJ) e **Etapa 3** (matching textual), carregue também o ficheiro da **DMS-Educação**."
+        )
+        return
+
+    run_etapa2_mapping(dms_df, censo_consolidado)
+
+    dms_work = st.session_state.get("dms_work")
+    censo_work = st.session_state.get("censo_work")
+    if isinstance(dms_work, pd.DataFrame) and isinstance(censo_work, pd.DataFrame):
+        run_etapa3_textual_merge(dms_work, censo_work)
+    else:
+        st.warning(
+            "Complete o **mapeamento de CNPJ** na Etapa 2 para habilitar o matching textual (Etapa 3)."
+        )
 
 
 if __name__ == "__main__":

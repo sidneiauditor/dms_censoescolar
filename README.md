@@ -1,72 +1,34 @@
 # DMS-Educação × Censo Escolar (local)
 
-Aplicação **Streamlit** para importar dados agregados da **DMS-Educação** e do **Censo Escolar**, normalizar, cruzar e produzir indicadores. **Tudo roda offline** neste equipamento — sem APIs externas, sem IA e sem nuvem.
-
-## Requisitos
-
-- **Python 3.12+**
-- Ficheiros de entrada em **CSV** ou **XLSX** (.xlsx)
-
-## Instalação
-
-Na pasta `app`:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-(macOS/Linux: `source .venv/bin/activate`)
+Aplicação **Streamlit** offline para carregar bases por **tipo** (sem nomes fixos de ficheiro), consolidar **Censo Escola ⊕ Matrícula** em campos lógicos estáveis e cruzar com a **DMS**.
 
 ## Execução
 
-A partir da pasta **`app`** (onde está `app.py`):
-
 ```powershell
+cd ...\app
 python -m streamlit run app.py
 ```
 
-O navegador abrirá por defeito (ex.: `http://localhost:8501`).
+## Arquitetura (resumo)
 
-## Etapa 1 — Resumo
+1. **Tipos de base** (`domain/dataset_kind.py`): `DMS_EDUCACAO`, `CENSO_ESCOLA`, `CENSO_MATRICULA` — independentes do ano do INEP.
+2. **Campos lógicos** (`domain/census_logical.py`): papéis semânticos (`CO_ENTIDADE`, `NO_ENTIDADE`, `matriculas`, …) mapeados pelos cabeçalhos reais do CSV/XLSX.
+3. **Carregamento** (`services/table_loader.py`): `@st.cache_data` por `(tipo, bytes, nome)` — o nome só serve à extensão; não há convenção `Tabela_*_AAAA.csv`.
+4. **Consolidação** (`services/census_consolidator.py`): projeção das colunas físicas → nomes lógicos; **merge externo** por `CO_ENTIDADE`; metadados `censo_exercicio`, `censo_fonte_*`.
+5. **Compatibilidade** (`services/ingest_cache.py`): delegação para `table_loader`.
 
-Upload de **DMS** e **Censo** (CSV/XLSX), visualização de nome, linhas e colunas.
+Fluxo UI: **Carregar** (3 slots) → **Mapear** → **Consolidar Censo** → **Etapa 2** (CNPJ) → **Etapa 3** (fuzzy texto).
 
-## Etapa 2 — O que faz
+## Pastas relevantes
 
-1. **DMS:** deteção automática da linha de **cabeçalho** (ignora linhas em branco à frente e penaliza linhas tipo “título” de relatório); corrige colunas **Unnamed**/vazias; desduplica nomes.
-2. **Censo:** leitura pelo fluxo padrão (`file_io`) + mesmo saneamento de colunas.
-3. **Mapeamento dinâmico** (selectboxes): CNPJ, razão social e quantidade na DMS; CNPJ, nome da escola e matrículas no Censo.
-4. **CNPJ:** apenas dígitos, `zfill` a 14 dígitos, validação de **dígitos verificadores**; contagem **vazios / inválidos / válidos** por base.
-5. **Cache** `@st.cache_data` em `services/ingest_cache.py` para repetir leituras sem reprocessar bytes.
-6. **Logs** em `outputs/app.log`.
-7. Preview de tabelas maior (altura fixa) + amostra de CNPJ normalizado (DMS).
+| Caminho | Função |
+|---------|--------|
+| `domain/` | Tipos de conjunto + especificação de campos lógicos |
+| `services/table_loader.py` | Cache + encaminhamento DMS smart vs leitura plana |
+| `services/census_consolidator.py` | Merge Escola⊕Matrícula |
+| `services/text_fuzzy_merge.py` | Etapa 3 RapidFuzz |
+| `utils/` | CSV/XLSX, texto, DMS ingest, CNPJ |
 
-**Ainda não faz:** merge (`join`), indicadores exportados, fuzzy, gráficos.
+## Exercício (ano)
 
-## Pastas e ficheiros principais
-
-| Item | Utilidade |
-|------|-----------|
-| `app.py` | UI Streamlit |
-| `services/ingest_cache.py` | Envoltório com `st.cache_data` para DMS e Censo |
-| `utils/file_io.py` | CSV/XLSX sem deteção inteligente (base Censo cru) |
-| `utils/dms_ingest.py` | Matriz → cabeçalho heurístico → DataFrame + `fix_unnamed_*` |
-| `utils/cnpj.py` | Normalização e estatísticas por coluna |
-| `uploads/` | Reservado (exports manuais opcionais) |
-| `outputs/` | `app.log` e Excel nas etapas seguintes |
-| `requirements.txt` | Dependências |
-
-## CSV e encoding
-
-Deteção de separador **`;` vs `,`** nas primeiras linhas; encodings `utf-8-sig`, `utf-8`, `latin-1`, `cp1252`. Microdados INEP costumam usar **`;`**.
-
-## Limpar cache Streamlit
-
-Menu **⋮** (canto superior direito) → **Clear cache**, se trocar o ficheiro mas o painel mostrar dados antigos.
-
-## Próximo passo
-
-Quando a Etapa 2 estiver validada, pedir **“implementar a Etapa 3”** (merge por CNPJ normalizado e `consolidado.xlsx`).
-Etapa 2 concluída.
+O campo **“Exercício do Censo”** na barra lateral não altera leitura de ficheiros; apenas grava **`censo_exercicio`** na base consolidada para rastreabilidade (2024, 2025, 2026, …).
