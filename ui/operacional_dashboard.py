@@ -45,8 +45,17 @@ def render_operacional_enrollment_dashboard(
         value=True,
         key="cif_ops_only_private_censo",
         help=(
-            "Quando marcado, escolas com TP_DEPENDENCIA ≠ 4 (federais, estaduais, municipais) "
-            "são removidas do Censo antes do cruzamento — eliminando omissões ilegítimas de ISS."
+            "Remove do Censo escolas com TP_DEPENDENCIA 1, 2 ou 3 (imunes/isentas de ISS). "
+            "Requer coluna de dependência no consolidado (ex.: dependencia_administrativa)."
+        ),
+    )
+    exclude_superior = st.checkbox(
+        "Excluir ensino superior sem Educação Básica (QT_MAT_BAS = 0)",
+        value=True,
+        key="cif_ops_exclude_superior_puro",
+        help=(
+            "Escolas privadas só de nível superior costumam não ter matrícula no Censo Básico; "
+            "com DMS = 0 geram falsa «omissão». Mantém redes com colégio + faculdade (QT_MAT_BAS > 0)."
         ),
     )
 
@@ -55,6 +64,7 @@ def render_operacional_enrollment_dashboard(
         "use_reference_month": True,
         "reference_month": 5,
         "only_private_censo": only_private,
+        "exclude_superior_puro": exclude_superior,
     }
 
     kpis = compute_enrollment_kpis(
@@ -95,13 +105,27 @@ def render_operacional_enrollment_dashboard(
     _, merge_meta = get_merged_aggregate_for_audits(
         df, cm, dms_work=dms_work, censo_work=censo_work, granularity=granularity, **kw
     )
-    if only_private and isinstance(merge_meta, dict):
-        n_privadas = merge_meta.get("n_privadas_censo")
-        if isinstance(n_privadas, int):
-            st.caption(
-                f"Censo filtrado: **{n_privadas:,}** escolas privadas "
-                f"(TP_DEPENDENCIA = 4). Públicas excluídas do cruzamento."
+    if isinstance(merge_meta, dict):
+        if merge_meta.get("dependencia_col_missing") and only_private:
+            st.warning(
+                "Coluna **TP_DEPENDENCIA** / **dependencia_administrativa** não encontrada no Censo — "
+                "públicas isentas **não** foram excluídas. Reprocesse com a tabela **Escola** do INEP."
             )
+        if only_private or exclude_superior:
+            parts: list[str] = []
+            n_priv = merge_meta.get("n_privadas_censo")
+            if isinstance(n_priv, int) and only_private:
+                parts.append(f"**{n_priv:,}** linhas privadas com EB no cruzamento")
+            n_pub = merge_meta.get("n_publicas_excluidas")
+            if isinstance(n_pub, int) and n_pub > 0:
+                parts.append(f"**{n_pub:,}** públicas excluídas")
+            n_sup = merge_meta.get("n_superior_puro_excluidas")
+            if isinstance(n_sup, int) and n_sup > 0 and exclude_superior:
+                parts.append(f"**{n_sup:,}** sem QT_MAT_BAS excluídas (superior puro)")
+            dep_col = merge_meta.get("dependencia_col")
+            if parts:
+                extra = f" (col. `{dep_col}`)" if dep_col else ""
+                st.caption("Censo filtrado: " + " · ".join(parts) + extra)
     ref_month_meta = merge_meta.get("ref_month_meta") if isinstance(merge_meta.get("ref_month_meta"), dict) else {}
     st.session_state["ref_month_meta"] = ref_month_meta
 

@@ -12,6 +12,7 @@ from services.cnpj_aggregation import (
     CNPJ_NORM_COL_DMS,
     aggregate_census_by_cnpj,
     aggregate_dms_by_cnpj,
+    filter_censo_for_fiscal_panel,
     filter_dms_to_reference_month,
 )
 
@@ -111,13 +112,28 @@ def test_aggregate_dms_monthly_vs_annual():
 def test_aggregate_census_only_private():
     df = pd.DataFrame(
         {
-            CNPJ_NORM_COL_CENSO: ["11111111000191", "22222222000100"],
-            "TP_DEPENDENCIA": [3, 4],
-            "QT_MAT_BAS": [100, 50],
+            CNPJ_NORM_COL_CENSO: ["11111111000191", "22222222000100", "33333333000177"],
+            "dependencia_administrativa": [3, 4, 4],
+            "QT_MAT_BAS": [100, 50, 0],
         }
     )
-    all_agg = aggregate_census_by_cnpj(df, only_private=False)
-    priv_agg = aggregate_census_by_cnpj(df, only_private=True)
-    assert len(all_agg) == 2
-    assert len(priv_agg) == 1
-    assert float(priv_agg[AGG_MC].iloc[0]) == 50.0
+    all_agg = aggregate_census_by_cnpj(df, only_private=False, exclude_superior_puro=False)
+    priv_agg = aggregate_census_by_cnpj(df, only_private=True, exclude_superior_puro=False)
+    priv_eb = aggregate_census_by_cnpj(df, only_private=True, exclude_superior_puro=True)
+    assert len(all_agg) == 3
+    assert len(priv_agg) == 2
+    assert len(priv_eb) == 1
+    assert float(priv_eb[AGG_MC].iloc[0]) == 50.0
+
+
+def test_filter_censo_logical_dependencia_column():
+    df = pd.DataFrame(
+        {
+            "dependencia_administrativa": ["3", "4"],
+            "QT_MAT_BAS": [10, 20],
+        }
+    )
+    out, meta = filter_censo_for_fiscal_panel(df, only_private=True, exclude_superior_puro=False)
+    assert len(out) == 1
+    assert meta["n_publicas_excluidas"] == 1
+    assert meta["dependencia_col"] == "dependencia_administrativa"

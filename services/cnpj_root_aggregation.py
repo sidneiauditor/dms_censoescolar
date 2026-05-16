@@ -28,8 +28,7 @@ from services.cnpj_aggregation import (
     CNPJ_NORM_COL_CENSO,
     CNPJ_NORM_COL_DMS,
     INTERNAL_CNPJ,
-    TP_DEPENDENCIA_PRIVADA,
-    _DEPENDENCIA_ALIASES,
+    filter_censo_for_fiscal_panel,
     _resolve_dms_quantity_column,
     _resolve_first_alias,
     _valid_norm_mask,
@@ -95,6 +94,7 @@ def aggregate_census_by_cnpj_root(
     col_cnpj_norm: str = CNPJ_NORM_COL_CENSO,
     co_entidade_column: str | None = None,
     only_private: bool = False,
+    exclude_superior_puro: bool = False,
 ) -> pd.DataFrame:
     """
     Por raiz: soma ``QT_MAT_BAS``, conta escolas (`CO_ENTIDADE` ínico) e CNPJs 14 distintos.
@@ -103,22 +103,12 @@ def aggregate_census_by_cnpj_root(
     if censo_df.empty or col_cnpj_norm not in censo_df.columns:
         return pd.DataFrame(columns=[CNPJ_RAIZ_COL, AGG_MC, AGG_N_ESCOLAS_CENSO, AGG_N_ESTAB_CENSO])
 
-    if only_private:
-        dep_col = _resolve_first_alias(censo_df, _DEPENDENCIA_ALIASES)
-        if dep_col and dep_col in censo_df.columns:
-            dep_num = pd.to_numeric(censo_df[dep_col], errors="coerce")
-            n_antes = len(censo_df)
-            censo_df = censo_df.loc[dep_num == TP_DEPENDENCIA_PRIVADA]
-            LOG.info(
-                "aggregate_census_by_cnpj_root: only_private=True → %d→%d linhas",
-                n_antes,
-                len(censo_df),
-            )
-        else:
-            LOG.warning(
-                "aggregate_census_by_cnpj_root: only_private=True mas TP_DEPENDENCIA"
-                " não encontrada — sem filtro."
-            )
+    if only_private or exclude_superior_puro:
+        censo_df, _ = filter_censo_for_fiscal_panel(
+            censo_df,
+            only_private=only_private,
+            exclude_superior_puro=exclude_superior_puro,
+        )
 
     qt_col = physical_qt_mat_bas_column(censo_df.columns)
     if not qt_col or qt_col not in censo_df.columns:

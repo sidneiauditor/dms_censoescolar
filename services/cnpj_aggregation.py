@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from services.census_semantics import physical_qt_mat_bas_column
+from services.census_semantics import CENSUS_CANONICAL_FIELDS, physical_qt_mat_bas_column
 from services.indicators import COL_BASE_CALC_ALIASES, COL_ISS_ALIASES
 from services.inferred_mapping import propose_dms_mapping
 
@@ -51,8 +51,118 @@ _DEPENDENCIA_ALIASES: tuple[str, ...] = (
     "TP_DEPENDENCIA",
     "DEPENDENCIA",
     "DEPENDENCIA_ADMINISTRATIVA",
+    "dependencia_administrativa",
 )
 TP_DEPENDENCIA_PRIVADA: int = 4  # 1=Federal 2=Estadual 3=Municipal 4=Privada
+
+
+def _resolve_dependencia_column(df: pd.DataFrame) -> str | None:
+    """Coluna de dependência no consolidado lógico, físico INEP ou ``censo__*``."""
+
+    hit = _resolve_first_alias(df, _DEPENDENCIA_ALIASES)
+    if hit:
+        return hit
+    alias_u = {a.strip().upper() for a in _DEPENDENCIA_ALIASES}
+    for c in df.columns:
+        cs = str(c).strip()
+        phys = cs.split("__", 1)[-1].strip().upper() if "__" in cs else cs.upper()
+        if phys in alias_u:
+            return cs
+    return None
+
+
+def _qt_mat_bas_series(df: pd.DataFrame) -> pd.Series | None:
+    qt_col = physical_qt_mat_bas_column(df.columns)
+    if qt_col and qt_col in df.columns:
+        return pd.to_numeric(df[qt_col], errors="coerce")
+    if "matriculas" in df.columns:
+        return pd.to_numeric(df["matriculas"], errors="coerce")
+    target = CENSUS_CANONICAL_FIELDS["matriculas_total"].upper()
+    for c in df.columns:
+        cs = str(c).strip()
+        if cs.upper().startswith("CENSO__"):
+            phys = cs.split("__", 1)[-1].strip().upper()
+            if phys == target and cs in df.columns:
+                return pd.to_numeric(df[cs], errors="coerce")
+    return None
+
+
+def filter_censo_for_fiscal_panel(
+    censo_df: pd.DataFrame,
+    *,
+    only_private: bool = True,
+    exclude_superior_puro: bool = True,
+    keep_missing_dependencia: bool = False,
+    keep_missing_matriculas_bas: bool = False,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Recorte do universo Censo para o painel DMS × Censo (Etapa 9).
+
+    - ``only_private``: mantém ``TP_DEPENDENCIA == 4`` (rede privada).
+    - ``exclude_superior_puro``: remove linhas sem matrícula na Educação Básica (``QT_MAT_BAS`` ≤ 0).
+    - ``keep_missing_*``: no consolidado prefixado, preserva linhas só DMS sem dado Censo na coluna.
+    """
+
+    meta: dict[str, Any] = {
+        "only_private": only_private,
+        "exclude_superior_puro": exclude_superior_puro,
+        "n_linhas_antes": len(censo_df.index),
+        "n_linhas_depois": len(censo_df.index),
+        "n_publicas_excluidas": 0,
+        "n_superior_puro_excluidas": 0,
+        "dependencia_col": None,
+        "dependencia_col_missing": False,
+    }
+    if censo_df.empty:
+        return censo_df.copy(), meta
+
+    work = censo_df
+    if only_private:
+        dep_col = _resolve_dependencia_column(work)
+        meta["dependencia_col"] = dep_col
+        if dep_col and dep_col in work.columns:
+            dep_num = pd.to_numeric(work[dep_col], errors="coerce")
+            if keep_missing_dependencia:
+                priv_mask = dep_num.isna() | dep_num.eq(TP_DEPENDENCIA_PRIVADA)
+            else:
+                priv_mask = dep_num.eq(TP_DEPENDENCIA_PRIVADA)
+            n_public = int((dep_num.notna() & dep_num.ne(TP_DEPENDENCIA_PRIVADA)).sum())
+            meta["n_publicas_excluidas"] = n_public
+            work = work.loc[priv_mask]
+            LOG.info(
+                "filter_censo_for_fiscal_panel: only_private → %d→%d linhas (%d públicas excluídas)",
+                len(censo_df.index),
+                len(work.index),
+                n_public,
+            )
+        else:
+            meta["dependencia_col_missing"] = True
+            LOG.warning(
+                "filter_censo_for_fiscal_panel: only_private=True mas dependência não encontrada — sem filtro."
+            )
+
+    if exclude_superior_puro:
+        qt = _qt_mat_bas_series(work)
+        if qt is not None:
+            if keep_missing_matriculas_bas:
+                bas_mask = qt.isna() | qt.gt(0)
+            else:
+                bas_mask = qt.gt(0)
+            n_sup = int((qt.notna() & qt.le(0)).sum())
+            meta["n_superior_puro_excluidas"] = n_sup
+            work = work.loc[bas_mask]
+            LOG.info(
+                "filter_censo_for_fiscal_panel: exclude_superior_puro → %d linhas com QT_MAT_BAS≤0 excluídas",
+                n_sup,
+            )
+        else:
+            LOG.warning(
+                "filter_censo_for_fiscal_panel: exclude_superior_puro=True mas QT_MAT_BAS ausente — sem filtro."
+            )
+
+    meta["n_linhas_depois"] = len(work.index)
+    meta["n_privadas_censo"] = len(work.index)
+    return work, meta
 
 
 def _resolve_dms_quantity_column(dms_df: pd.DataFrame, column_map: dict[str, Any]) -> str | None:
@@ -216,6 +326,7 @@ def aggregate_census_by_cnpj(
     col_cnpj_norm: str = CNPJ_NORM_COL_CENSO,
     co_entidade_column: str | None = None,
     only_private: bool = False,
+    exclude_superior_puro: bool = False,
 ) -> pd.DataFrame:
     """
     Uma linha por CNPJ normalizado (14 dígitos): soma **apenas** ``QT_MAT_BAS``.
@@ -228,23 +339,12 @@ def aggregate_census_by_cnpj(
             columns=[INTERNAL_CNPJ, AGG_MC, AGG_N_ESCOLAS_CENSO],
         )
 
-    if only_private:
-        dep_col = _resolve_first_alias(censo_df, _DEPENDENCIA_ALIASES)
-        if dep_col and dep_col in censo_df.columns:
-            dep_num = pd.to_numeric(censo_df[dep_col], errors="coerce")
-            n_antes = len(censo_df)
-            censo_df = censo_df.loc[dep_num == TP_DEPENDENCIA_PRIVADA]
-            LOG.info(
-                "aggregate_census_by_cnpj: only_private=True → %d→%d linhas (excluídas %d públicas)",
-                n_antes,
-                len(censo_df),
-                n_antes - len(censo_df),
-            )
-        else:
-            LOG.warning(
-                "aggregate_census_by_cnpj: only_private=True mas TP_DEPENDENCIA não encontrada"
-                " no Censo — sem filtro aplicado."
-            )
+    if only_private or exclude_superior_puro:
+        censo_df, _ = filter_censo_for_fiscal_panel(
+            censo_df,
+            only_private=only_private,
+            exclude_superior_puro=exclude_superior_puro,
+        )
 
     qt_col = physical_qt_mat_bas_column(censo_df.columns)
     if not qt_col or qt_col not in censo_df.columns:
